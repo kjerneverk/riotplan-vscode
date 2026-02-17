@@ -1,0 +1,61 @@
+name: Run Tests
+
+on:
+  push:
+    branches:
+      - main
+      - working
+      - 'release/**'
+      - 'feature/**'
+      - 'dependabot/**'
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: test-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        run: |
+          # Use public npm registry (package-lock.json is gitignored)
+          npm config set registry https://registry.npmjs.org/
+          # Clean install to ensure platform-specific optional deps are resolved correctly
+          rm -rf node_modules package-lock.json
+          
+          # Retry logic for npm install with exponential backoff
+          MAX_ATTEMPTS=5
+          ATTEMPT=1
+          WAIT_TIME=10
+          
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            echo "npm install attempt $ATTEMPT of $MAX_ATTEMPTS..."
+            if npm install --force; then
+              echo "✓ npm install succeeded"
+              exit 0
+            fi
+            
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              echo "⏳ npm install failed, waiting ${WAIT_TIME}s before retry..."
+              sleep $WAIT_TIME
+              WAIT_TIME=$((WAIT_TIME * 2))
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+          
+          echo "✗ npm install failed after $MAX_ATTEMPTS attempts"
+          exit 1
+        timeout-minutes: 15
+      - run: npm run compile

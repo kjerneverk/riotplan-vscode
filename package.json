@@ -58,12 +58,21 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "package": "vsce package",
+    "lint": "echo 'No linting configured yet'",
+    "test": "echo 'No tests configured yet'"
   },
   "devDependencies": {
-    "@types/node": "^20.0.0",
+    "@types/node": "^24.0.0",
     "@types/vscode": "^1.60.0",
-    "typescript": "^5.0.0"
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.8.0"
   },
-  "dependencies": {}
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kjerneverk/riotplan-vscode"
+  },
+  "license": "Apache-2.0",
+  "author": "Tim O'Brien <tobrien@discursive.com>"
 }
