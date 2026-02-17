@@ -1,0 +1,69 @@
+{
+  "name": "riotplan-vscode",
+  "displayName": "RiotPlan",
+  "description": "Plan management for RiotPlan HTTP server",
+  "version": "1.0.0",
+  "publisher": "kjerneverk",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "RiotPlan",
+      "properties": {
+        "riotplan.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:3002",
+          "description": "RiotPlan HTTP MCP server URL"
+        }
+      }
+    },
+    "views": {
+      "explorer": [
+        {
+          "id": "riotplan-plans",
+          "name": "Plans"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "riotplan.refreshPlans",
+        "title": "Refresh Plans",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "riotplan.openPlan",
+        "title": "Open Plan"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "riotplan.refreshPlans",
+          "when": "view == riotplan-plans",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.60.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {}
+}
