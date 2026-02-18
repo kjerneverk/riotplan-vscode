@@ -1,0 +1,21 @@
+name: Node.js Package (GitHub Packages)
+
+on:
+  release:
+    types: [created]
+  push:
+    branches:
+      - working
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  publish-github-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Skipping npm publish for VS Code extension
+        run: echo "This workflow is disabled for riotplan-vscode (VS Code extension)"
