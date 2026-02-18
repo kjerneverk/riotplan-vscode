@@ -28,10 +28,16 @@ interface McpResponse {
 
 export class HttpMcpClient {
     private sessionId?: string;
+    private initialized = false;
 
     constructor(private serverUrl: string) {}
 
     async sendRequest(method: string, params?: any): Promise<any> {
+        // MCP protocol requires initialize handshake before any other requests
+        if (!this.initialized && method !== 'initialize') {
+            await this.initialize();
+        }
+
         const request: McpRequest = {
             jsonrpc: '2.0',
             id: Math.random().toString(36).substring(2),
@@ -53,6 +59,31 @@ export class HttpMcpClient {
         return response.data.result;
     }
 
+    private async initialize(): Promise<void> {
+        const request: McpRequest = {
+            jsonrpc: '2.0',
+            id: 'init-1',
+            method: 'initialize',
+            params: {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'riotplan-vscode', version: '1.0.0' },
+            },
+        };
+
+        const response = await this.httpPost('/mcp', request);
+
+        if (response.headers['mcp-session-id']) {
+            this.sessionId = response.headers['mcp-session-id'];
+        }
+
+        if (response.data.error) {
+            throw new Error(`MCP initialization failed: ${response.data.error.message}`);
+        }
+
+        this.initialized = true;
+    }
+
     private async httpPost(path: string, body: any): Promise<{ data: McpResponse; headers: any }> {
         return new Promise((resolve, reject) => {
             const url = new URL(this.serverUrl + path);
@@ -68,6 +99,8 @@ export class HttpMcpClient {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
+                    // Both required by MCP Streamable HTTP transport spec
+                    'Accept': 'application/json, text/event-stream',
                     'Content-Length': Buffer.byteLength(postData),
                     ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}),
                 },
