@@ -55,18 +55,29 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "clean": "rm -rf dist out",
+    "build": "tsc -p ./",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
-    "lint": "echo 'No linting configured yet'",
-    "test": "echo 'No tests configured yet'"
+    "lint": "eslint src",
+    "test": "echo 'No tests configured yet'",
+    "precommit": "npm run build && npm run lint && npm run test",
+    "prepublishOnly": "npm run clean && npm run build",
+    "vscode:prepublish": "npm run build"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@eslint/eslintrc": "^3.3.1",
+    "@eslint/js": "^9.28.0",
+    "@types/node": "^24.10.9",
     "@types/vscode": "^1.60.0",
+    "@typescript-eslint/eslint-plugin": "^8.34.0",
+    "@typescript-eslint/parser": "^8.34.0",
     "@vscode/vsce": "^3.0.0",
-    "typescript": "^5.8.0"
+    "eslint": "^9.28.0",
+    "eslint-plugin-import": "^2.31.0",
+    "globals": "^17.0.0",
+    "typescript": "^5.8.3"
   },
   "dependencies": {},
   "repository": {
