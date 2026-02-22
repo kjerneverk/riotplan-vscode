@@ -34,6 +34,21 @@ npm install
 npm run compile
 ```
 
+### Debugging
+
+1. **Start the RiotPlan MCP server** (in a separate terminal):
+   ```bash
+   riotplan-mcp-http --port 3002 --plans-dir /path/to/plans
+   ```
+
+2. **Open the extension folder** in VS Code:
+   - For multi-root workspace (e.g. kjerneverk): Use **"Launch Extension"** from the Run and Debug view
+   - For single folder: Open `riotplan-vscode` as the workspace root, then use **"Launch Extension (single folder)"**
+
+3. **Press F5** or run **Debug: Start Debugging** from the Command Palette
+
+4. A new **Extension Development Host** window opens with the extension loaded. Set breakpoints in `src/` and they will hit when the extension runs.
+
 ## Building
 
 ```bash
