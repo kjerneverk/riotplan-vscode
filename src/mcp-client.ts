@@ -139,11 +139,61 @@ export class HttpMcpClient {
         });
     }
 
-    async getPlanStatus(planId: string): Promise<any> {
-        return await this.sendRequest('tools/call', {
-            name: 'riotplan_status',
-            arguments: { planId },
+    private async callToolWithArgFallback(
+        name: string,
+        primaryArgs: Record<string, unknown>,
+        fallbackArgs: Record<string, unknown>
+    ): Promise<any> {
+        try {
+            return await this.sendRequest('tools/call', {
+                name,
+                arguments: primaryArgs,
+            });
+        } catch (primaryError) {
+            try {
+                return await this.sendRequest('tools/call', {
+                    name,
+                    arguments: fallbackArgs,
+                });
+            } catch {
+                throw primaryError;
+            }
+        }
+    }
+
+    async getPlanStatus(planPathOrId: string): Promise<any> {
+        const result = await this.callToolWithArgFallback(
+            'riotplan_status',
+            { planId: planPathOrId, verbose: true },
+            { path: planPathOrId, verbose: true }
+        );
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    async readContext(planPath: string): Promise<any> {
+        const result = await this.callToolWithArgFallback(
+            'riotplan_read_context',
+            { planId: planPath, depth: 'full' },
+            { path: planPath, depth: 'full' }
+        );
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    async listSteps(planPath: string): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_step_list',
+            arguments: { path: planPath, all: true },
         });
+        if (result?.content?.[0]?.type === 'text') {
+            try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
+        }
+        return result;
     }
 
     async updateStep(planId: string, step: number, status: string): Promise<any> {
@@ -151,6 +201,63 @@ export class HttpMcpClient {
             name: 'riotplan_step_update',
             arguments: { planId, step, status },
         });
+    }
+
+    async readResource(uri: string): Promise<string> {
+        const result = await this.sendRequest('resources/read', { uri });
+        if (result?.contents?.[0]?.text) {
+            return result.contents[0].text;
+        }
+        return '';
+    }
+
+    async getPlanResource(planPathOrId: string): Promise<any | null> {
+        try {
+            const content = await this.readResource(`riotplan://plan/${planPathOrId}`);
+            if (!content) {
+                return null;
+            }
+            return JSON.parse(content);
+        } catch {
+            return null;
+        }
+    }
+
+    async addEvidence(
+        planPath: string,
+        description: string,
+        source: string,
+        summary: string,
+        content: string
+    ): Promise<any> {
+        const args: any = { path: planPath, description, gatheringMethod: 'manual' };
+        if (source) { args.source = source; }
+        if (summary) { args.summary = summary; }
+        if (content) { args.content = content; }
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_idea_add_evidence',
+            arguments: args,
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
+        }
+        return result;
+    }
+
+    async setIdeaContent(planPathOrId: string, content: string): Promise<any> {
+        const result = await this.callToolWithArgFallback(
+            'riotplan_idea_set_content',
+            { planId: planPathOrId, content },
+            { path: planPathOrId, content }
+        );
+        if (result?.content?.[0]?.type === 'text') {
+            try {
+                return JSON.parse(result.content[0].text);
+            } catch {
+                return result.content[0].text;
+            }
+        }
+        return result;
     }
 
     async healthCheck(): Promise<boolean> {

@@ -11,14 +11,18 @@ export class PlanItem extends vscode.TreeItem {
     constructor(
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        public readonly path?: string,
         public readonly uuid?: string,
+        public readonly planId?: string,
         public readonly stage?: string,
-        public readonly progress?: { completed: number; total: number; percentage: number }
+        public readonly progress?: { completed: number; total: number; percentage: number },
+        public readonly project?: any
     ) {
         super(label, collapsibleState);
 
-        if (uuid) {
-            this.tooltip = `${label} (${uuid.substring(0, 8)})`;
+        if (path || uuid || planId) {
+            const idSuffix = planId || uuid;
+            this.tooltip = idSuffix ? `${label} (${idSuffix.substring(0, 8)})` : label;
             this.description = stage;
             this.contextValue = 'plan';
             this.command = {
@@ -84,11 +88,14 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem> {
             return plans.map(
                 (plan: any) =>
                     new PlanItem(
-                        plan.name || plan.id,
+                        plan.name || plan.title || plan.id,
                         vscode.TreeItemCollapsibleState.None,
+                        plan.path,
                         plan.uuid,
+                        plan.planId || plan.id,
                         plan.stage,
-                        plan.progress
+                        plan.progress,
+                        plan.project
                     )
             );
         } catch (error) {
