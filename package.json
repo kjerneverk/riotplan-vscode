@@ -25,11 +25,24 @@
         }
       }
     },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "riotplan",
+          "title": "RiotPlan",
+          "icon": "media/riotplan-icon.svg"
+        }
+      ]
+    },
     "views": {
-      "explorer": [
+      "riotplan": [
         {
           "id": "riotplan-plans",
           "name": "Plans"
+        },
+        {
+          "id": "riotplan-connection",
+          "name": "Connection Status"
         }
       ]
     },
@@ -42,6 +55,16 @@
       {
         "command": "riotplan.openPlan",
         "title": "Open Plan"
+      },
+      {
+        "command": "riotplan.configureServerUrl",
+        "title": "Configure Server URL",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "riotplan.reconnect",
+        "title": "Reconnect",
+        "icon": "$(plug)"
       }
     ],
     "menus": {
@@ -49,6 +72,16 @@
         {
           "command": "riotplan.refreshPlans",
           "when": "view == riotplan-plans",
+          "group": "navigation"
+        },
+        {
+          "command": "riotplan.configureServerUrl",
+          "when": "view == riotplan-connection",
+          "group": "navigation"
+        },
+        {
+          "command": "riotplan.reconnect",
+          "when": "view == riotplan-connection",
           "group": "navigation"
         }
       ]
