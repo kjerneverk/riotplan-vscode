@@ -65,10 +65,25 @@
         "command": "riotplan.reconnect",
         "title": "Reconnect",
         "icon": "$(plug)"
+      },
+      {
+        "command": "riotplan.openDashboard",
+        "title": "Open Dashboard",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "riotplan.copyPlanUrl",
+        "title": "Copy Plan URL",
+        "icon": "$(link-external)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "riotplan.openDashboard",
+          "when": "view == riotplan-plans",
+          "group": "navigation"
+        },
         {
           "command": "riotplan.refreshPlans",
           "when": "view == riotplan-plans",
@@ -83,6 +98,13 @@
           "command": "riotplan.reconnect",
           "when": "view == riotplan-connection",
           "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "riotplan.copyPlanUrl",
+          "when": "view == riotplan-plans && viewItem == plan",
+          "group": "navigation@2"
         }
       ]
     }
