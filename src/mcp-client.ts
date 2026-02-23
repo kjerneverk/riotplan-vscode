@@ -258,8 +258,8 @@ export class HttpMcpClient {
         target: 'active' | 'done' | 'hold'
     ): Promise<any> {
         return await this.sendRequest('tools/call', {
-            name: 'riotplan_move_plan',
-            arguments: { planId, target },
+            name: 'riotplan_plan',
+            arguments: { action: 'move', planId, target },
         });
     }
 
@@ -309,16 +309,36 @@ export class HttpMcpClient {
         return result;
     }
 
-    async listSteps(planPath: string): Promise<any> {
-        const result = await this.callToolWithArgFallback(
-            'riotplan_step_list',
-            { planId: planPath, all: true },
-            { path: planPath, all: true }
-        );
-        if (result?.content?.[0]?.type === 'text') {
-            try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
+    async listSteps(planPathOrId: string): Promise<Array<{
+        number: number;
+        title: string;
+        status: string;
+        file?: string;
+        startedAt?: string;
+        completedAt?: string;
+    }>> {
+        try {
+            const resource = await this.readResource(`riotplan://steps/${planPathOrId}`);
+            const parsed = JSON.parse(resource);
+            const rawSteps = Array.isArray(parsed)
+                ? parsed
+                : Array.isArray(parsed?.steps)
+                    ? parsed.steps
+                    : [];
+
+            return rawSteps
+                .map((step: any) => ({
+                    number: Number(step?.number ?? 0),
+                    title: String(step?.title ?? ''),
+                    status: String(step?.status ?? 'pending'),
+                    file: typeof step?.file === 'string' ? step.file : undefined,
+                    startedAt: typeof step?.startedAt === 'string' ? step.startedAt : undefined,
+                    completedAt: typeof step?.completedAt === 'string' ? step.completedAt : undefined,
+                }))
+                .filter((step: { number: number; title: string }) => Number.isFinite(step.number) && step.number > 0 && step.title.length > 0);
+        } catch {
+            return [];
         }
-        return result;
     }
 
     async updateStep(planId: string, step: number, status: string): Promise<any> {
@@ -360,9 +380,9 @@ export class HttpMcpClient {
         if (summary) { args.summary = summary; }
         if (content) { args.content = content; }
         const result = await this.callToolWithArgFallback(
-            'riotplan_idea_add_evidence',
-            args,
-            { ...args, path: planPath, planId: undefined }
+            'riotplan_idea',
+            { action: 'add_evidence', ...args },
+            { action: 'add_evidence', ...args, path: planPath, planId: undefined }
         );
         if (result?.content?.[0]?.type === 'text') {
             try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
@@ -372,9 +392,9 @@ export class HttpMcpClient {
 
     async setIdeaContent(planPathOrId: string, content: string): Promise<any> {
         const result = await this.callToolWithArgFallback(
-            'riotplan_idea_set_content',
-            { planId: planPathOrId, content },
-            { path: planPathOrId, content }
+            'riotplan_idea',
+            { action: 'set_content', planId: planPathOrId, content },
+            { action: 'set_content', path: planPathOrId, content }
         );
         if (result?.content?.[0]?.type === 'text') {
             try {

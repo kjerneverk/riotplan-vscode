@@ -116,12 +116,13 @@ export class PlanDetailPanel {
         this._panel.webview.html = this._getLoadingHtml();
 
         try {
-            const [status, context, planResource, summaryArtifact, executionPlanArtifact] = await Promise.all([
+            const [status, context, planResource, summaryArtifact, executionPlanArtifact, steps] = await Promise.all([
                 this.mcpClient.getPlanStatus(this.planPath),
                 this.mcpClient.readContext(this.planPath).catch(() => null),
                 this.mcpClient.getPlanResource(this.planPath).catch(() => null),
                 this.mcpClient.getArtifact(this.planPath, 'summary').catch(() => null),
                 this.mcpClient.getExecutionPlan(this.planPath).catch(() => null),
+                this.mcpClient.listSteps(this.planPath).catch(() => []),
             ]);
 
             const enrichedContext = {
@@ -130,7 +131,12 @@ export class PlanDetailPanel {
                 executionPlan: executionPlanArtifact,
             };
 
-            this._panel.webview.html = this._getHtml(status, enrichedContext, planResource);
+            const statusWithSteps = {
+                ...(status || {}),
+                steps: Array.isArray(steps) ? steps : [],
+            };
+
+            this._panel.webview.html = this._getHtml(statusWithSteps, enrichedContext, planResource);
         } catch (error) {
             this._panel.webview.html = this._getErrorHtml(String(error));
         }
@@ -1491,7 +1497,7 @@ body {
           ${selectedApproach ? `<div class="selected-approach-banner"><span class="approach-label">Selected Approach:</span> <strong>${this._esc(selectedApproach)}</strong></div>` : ''}
           <div class="md-content" id="shaping-full-md"></div>
         </div>`
-        : `<div class="empty-state"><span class="empty-icon">◇</span><p>No shaping document found</p><p class="empty-hint">Use riotplan_shaping_start to begin comparing approaches</p></div>`
+        : `<div class="empty-state"><span class="empty-icon">◇</span><p>No shaping document found</p><p class="empty-hint">Use riotplan_shaping(action: "start") to begin comparing approaches</p></div>`
 }
 </div>
 
@@ -1563,7 +1569,11 @@ function renderMarkdown(md) {
     html = html.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
     html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
     html = html.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
-    html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+    // Only treat underscores as emphasis delimiters at word boundaries.
+    // This preserves identifiers like riotplan_step.
+    html = html.replace(/(^|[^\\w])_([^_\\n]+)_(?=[^\\w]|$)/g, function(_, prefix, text) {
+        return prefix + '<em>' + text + '</em>';
+    });
 
     // Inline code
     html = html.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
