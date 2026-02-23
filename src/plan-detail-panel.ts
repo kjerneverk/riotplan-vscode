@@ -18,6 +18,7 @@ export class PlanDetailPanel {
     private unsubscribeNotification?: () => void;
     private unsubscribeSessionRecovered?: () => void;
     private refreshTimer?: ReturnType<typeof setTimeout>;
+    private readonly subscribedResourceUris = new Set<string>();
 
     private constructor(
         panel: vscode.WebviewPanel,
@@ -36,19 +37,16 @@ export class PlanDetailPanel {
         this.unsubscribeNotification = this.mcpClient.onNotification(
             'notifications/resource_changed',
             async (data: unknown) => {
-                const params = data as { uri?: string };
-                if (!params?.uri) {
-                    return;
-                }
-                if (params.uri === this.resourceUri || params.uri.includes(this.planPath)) {
+                const uris = this.extractNotificationUris(data);
+                if (uris.some((uri) => this.resourceMatchesPlan(uri))) {
                     this.scheduleRefresh();
                 }
             }
         );
         this.unsubscribeSessionRecovered = this.mcpClient.onSessionRecovered(async () => {
-            await this.subscribeToPlanResource();
+            await this.subscribeToPlanResources();
         });
-        void this.subscribeToPlanResource();
+        void this.subscribeToPlanResources();
         this._loadContent();
     }
 
@@ -147,16 +145,70 @@ export class PlanDetailPanel {
             clearTimeout(this.refreshTimer);
         }
         this.refreshTimer = setTimeout(() => {
+            this.refreshTimer = undefined;
             void this._loadContent();
         }, 250);
     }
 
-    private async subscribeToPlanResource(): Promise<void> {
-        try {
-            await this.mcpClient.subscribeToResource(this.resourceUri);
-        } catch {
-            // Continue without hard-failing the panel if subscribe is unavailable.
+    private getPlanResourceUris(): string[] {
+        return [
+            `riotplan://plan/${this.planPath}`,
+            `riotplan://status/${this.planPath}`,
+            `riotplan://steps/${this.planPath}`,
+            `riotplan://history/${this.planPath}`,
+            `riotplan://shaping/${this.planPath}`,
+            `riotplan://artifact/${this.planPath}?type=summary`,
+            `riotplan://artifact/${this.planPath}?type=execution_plan`,
+        ];
+    }
+
+    private async subscribeToPlanResources(): Promise<void> {
+        const uris = this.getPlanResourceUris();
+        for (const uri of uris) {
+            try {
+                await this.mcpClient.subscribeToResource(uri);
+                this.subscribedResourceUris.add(uri);
+            } catch {
+                // Continue without hard-failing the panel if a specific subscription is unavailable.
+            }
         }
+    }
+
+    private extractNotificationUris(data: unknown): string[] {
+        const params = data as {
+            uri?: unknown;
+            resource?: { uri?: unknown };
+            resources?: Array<{ uri?: unknown }>;
+            uris?: unknown[];
+        };
+        const values: unknown[] = [
+            params?.uri,
+            params?.resource?.uri,
+            ...(Array.isArray(params?.resources) ? params.resources.map((resource) => resource?.uri) : []),
+            ...(Array.isArray(params?.uris) ? params.uris : []),
+        ];
+        return values.filter((value): value is string => typeof value === 'string' && value.length > 0);
+    }
+
+    private resourceMatchesPlan(uri: string): boolean {
+        const normalizedPlanPath = this.planPath.toLowerCase();
+        const encodedPlanPath = encodeURIComponent(this.planPath).toLowerCase();
+        const candidates = [uri];
+
+        try {
+            candidates.push(decodeURIComponent(uri));
+        } catch {
+            // Ignore malformed URI encoding and just use original URI.
+        }
+
+        return candidates.some((candidate) => {
+            const normalized = candidate.toLowerCase();
+            return (
+                normalized === this.resourceUri.toLowerCase() ||
+                normalized.includes(normalizedPlanPath) ||
+                normalized.includes(encodedPlanPath)
+            );
+        });
     }
 
     private async _saveIdeaContent(content: string): Promise<void> {
@@ -274,7 +326,10 @@ export class PlanDetailPanel {
         this.unsubscribeNotification = undefined;
         this.unsubscribeSessionRecovered?.();
         this.unsubscribeSessionRecovered = undefined;
-        void this.mcpClient.unsubscribeFromResource(this.resourceUri).catch(() => undefined);
+        for (const uri of this.subscribedResourceUris) {
+            void this.mcpClient.unsubscribeFromResource(uri).catch(() => undefined);
+        }
+        this.subscribedResourceUris.clear();
         PlanDetailPanel.currentPanels.delete(this.planPath);
         this._panel.dispose();
         while (this._disposables.length) {
@@ -1520,21 +1575,48 @@ body {
 </div>
 
 <script>
-// ── Tab switching ────────────────────────────────────────────
+// ── VSCode API + tab state + refresh ────────────────────────
+var vscode = acquireVsCodeApi();
+var webviewState = vscode.getState() || {};
+
+function getActiveTab() {
+    var activeBtn = document.querySelector('.tab-btn.active');
+    if (!activeBtn) { return 'overview'; }
+    var tab = activeBtn.getAttribute('data-tab');
+    return tab || 'overview';
+}
+
+function activateTab(tab, persist) {
+    var targetTab = tab || 'overview';
+    document.querySelectorAll('.tab-btn').forEach(function(btn) {
+        var isActive = btn.getAttribute('data-tab') === targetTab;
+        btn.classList.toggle('active', isActive);
+    });
+    document.querySelectorAll('.pane').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'pane-' + targetTab);
+    });
+    if (persist) {
+        webviewState.activeTab = targetTab;
+        vscode.setState(webviewState);
+    }
+}
+
 document.querySelectorAll('.tab-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-        var tab = btn.dataset.tab;
-        document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
-        document.querySelectorAll('.pane').forEach(function(p) { p.classList.remove('active'); });
-        btn.classList.add('active');
-        var pane = document.getElementById('pane-' + tab);
-        if (pane) { pane.classList.add('active'); }
+        activateTab(btn.dataset.tab || 'overview', true);
     });
 });
 
-// ── VSCode API + Refresh ─────────────────────────────────────
-var vscode = acquireVsCodeApi();
-function refresh() { vscode.postMessage({ command: 'refresh' }); }
+var initialTab = typeof webviewState.activeTab === 'string' ? webviewState.activeTab : 'overview';
+activateTab(initialTab, false);
+if (!webviewState.activeTab) {
+    webviewState.activeTab = initialTab;
+    vscode.setState(webviewState);
+}
+
+function refresh() {
+    vscode.postMessage({ command: 'refresh', activeTab: getActiveTab() });
+}
 function copyPlanId() { vscode.postMessage({ command: 'copyPlanId' }); }
 
 // ── Minimal markdown renderer ────────────────────────────────
