@@ -109,6 +109,8 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         const draggable = source
             .filter((item) => item.contextValue === 'plan' && item.path)
             .map((item) => ({
+                path: item.path!,
+                uuid: item.uuid,
                 planId: item.uuid || item.planId || item.path!,
                 category: item.category || 'active',
                 name: item.label,
@@ -135,7 +137,13 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
 
         const raw = transferItem.value;
         const rawText = typeof raw === 'string' ? raw : String(raw ?? '');
-        let dragged: Array<{ planId: string; category: PlanCategory; name: string }> = [];
+        let dragged: Array<{
+            path?: string;
+            uuid?: string;
+            planId: string;
+            category: PlanCategory;
+            name: string;
+        }> = [];
         try {
             const parsed = JSON.parse(rawText);
             if (Array.isArray(parsed)) {
@@ -158,7 +166,7 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
                 continue;
             }
             try {
-                await this.movePlanViaMcp(item.planId, targetCategory);
+                await this.movePlanViaMcp(item, targetCategory);
                 moved.push(item.name || item.planId);
             } catch (error) {
                 const errText = error instanceof Error ? error.message : String(error);
@@ -233,23 +241,48 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         return undefined;
     }
 
-    private async movePlanViaMcp(planId: string, destinationCategory: 'done' | 'hold'): Promise<void> {
-        const response = await this.mcpClient.movePlan(planId, destinationCategory);
-        if (response?.isError) {
-            const errorText = response?.content?.[0]?.text || 'MCP move tool returned an error.';
-            throw new Error(errorText);
-        }
-        const content = response?.content?.[0];
-        if (content?.type !== 'text') {
-            return;
-        }
-        try {
-            const parsed = JSON.parse(content.text);
-            if (parsed?.moved === false || parsed?.moved === true) {
-                return;
+    private async movePlanViaMcp(
+        item: { path?: string; uuid?: string; planId: string },
+        destinationCategory: 'done' | 'hold'
+    ): Promise<void> {
+        const candidates = [item.path, item.uuid, item.planId].filter(
+            (candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0
+        );
+        const uniqueCandidates = [...new Set(candidates)];
+        let lastError: Error | undefined;
+
+        for (const candidate of uniqueCandidates) {
+            try {
+                const response = await this.mcpClient.movePlan(candidate, destinationCategory);
+                if (response?.isError) {
+                    const errorText = response?.content?.[0]?.text || 'MCP move tool returned an error.';
+                    throw new Error(errorText);
+                }
+                const content = response?.content?.[0];
+                if (content?.type !== 'text') {
+                    return;
+                }
+                try {
+                    const parsed = JSON.parse(content.text);
+                    if (parsed?.moved === false || parsed?.moved === true) {
+                        return;
+                    }
+                } catch {
+                    // Non-JSON text is treated as a successful message from MCP.
+                    return;
+                }
+            } catch (error) {
+                const errText = error instanceof Error ? error.message : String(error);
+                lastError = error instanceof Error ? error : new Error(errText);
+                const missingPlan = /could not find plan/i.test(errText);
+                if (!missingPlan) {
+                    throw lastError;
+                }
             }
-        } catch {
-            // Non-JSON text is treated as a successful message from MCP.
+        }
+
+        if (lastError) {
+            throw lastError;
         }
     }
 }
