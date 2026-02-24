@@ -107,6 +107,9 @@ export class PlanDetailPanel {
             case 'copyEvidenceContent':
                 await this._copyEvidenceContentToClipboard(msg.filename, msg.content, msg.idx);
                 break;
+            case 'openProjectEntity':
+                await this._openProjectEntity(msg.project);
+                break;
         }
     }
 
@@ -315,6 +318,15 @@ export class PlanDetailPanel {
             this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: false, kind: 'content', idx });
             vscode.window.showErrorMessage(`Failed to copy evidence content: ${error}`);
         }
+    }
+
+    private async _openProjectEntity(project?: any): Promise<void> {
+        const projectId = typeof project?.id === 'string' ? project.id : undefined;
+        if (!projectId) {
+            vscode.window.showWarningMessage('This plan is not currently mapped to a project entity.');
+            return;
+        }
+        await vscode.commands.executeCommand('riotplan.openProjectEntity', project);
     }
 
     private dispose(): void {
@@ -533,6 +545,7 @@ export class PlanDetailPanel {
         const summaryJson = escapeScript(JSON.stringify(summaryContent));
         const executionPlanJson = escapeScript(JSON.stringify(executionPlanContent));
         const evidenceFilesJson = escapeScript(JSON.stringify(evidenceFiles));
+        const projectJson = escapeScript(JSON.stringify(project || null));
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -1431,7 +1444,7 @@ body {
     ${code ? `<span class="meta-item"><span class="label">code:</span> ${code}<button id="copy-plan-id-btn" class="copy-inline-btn" title="Copy plan ID">⧉</button></span>` : ''}
     ${lastUpdated ? `<span class="meta-item"><span class="label">updated:</span> ${this._esc(lastUpdated)}</span>` : ''}
     ${status?.lastCompleted ? `<span class="meta-item"><span class="label">last step:</span> ${status.lastCompleted}</span>` : ''}
-    ${projectName ? `<span class="meta-item"><span class="label">project:</span> ${projectName}</span>` : ''}
+    ${projectName ? `<span class="meta-item"><span class="label">project:</span> <a href="#" id="open-project-entity-link" class="meta-link">${projectName}</a></span>` : ''}
     ${projectPath ? `<span class="meta-item"><span class="label">project path:</span> <span class="mono">${projectPath}</span></span>` : ''}
     ${repoUrl ? `<span class="meta-item"><span class="label">repo:</span> <a class="meta-link" href="${repoUrl}">${repoUrl}</a></span>` : ''}
   </div>
@@ -1618,6 +1631,9 @@ function refresh() {
     vscode.postMessage({ command: 'refresh', activeTab: getActiveTab() });
 }
 function copyPlanId() { vscode.postMessage({ command: 'copyPlanId' }); }
+function openProjectEntity() {
+    vscode.postMessage({ command: 'openProjectEntity', project: projectEntity });
+}
 
 // ── Minimal markdown renderer ────────────────────────────────
 function renderMarkdown(md) {
@@ -1764,6 +1780,7 @@ var shapingMd = ${shapingJson};
 var summaryMd = ${summaryJson};
 var executionPlanMd = ${executionPlanJson};
 var evidenceEntries = ${evidenceFilesJson};
+var projectEntity = ${projectJson};
 try {
     var ideaEl = document.getElementById('idea-md');
     if (ideaEl && ideaMd) { ideaEl.innerHTML = renderMarkdown(ideaMd); }
@@ -1804,6 +1821,13 @@ var cancelIdeaBtn = document.getElementById('cancel-idea-btn');
 if (cancelIdeaBtn) { cancelIdeaBtn.addEventListener('click', cancelEditIdea); }
 var copyPlanIdBtn = document.getElementById('copy-plan-id-btn');
 if (copyPlanIdBtn) { copyPlanIdBtn.addEventListener('click', copyPlanId); }
+var openProjectEntityLink = document.getElementById('open-project-entity-link');
+if (openProjectEntityLink) {
+    openProjectEntityLink.addEventListener('click', function(event) {
+        event.preventDefault();
+        openProjectEntity();
+    });
+}
 
 // ── Step expansion ───────────────────────────────────────────
 var stepLoaded = {};

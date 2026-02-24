@@ -47,6 +47,10 @@ export class HttpMcpClient {
 
     constructor(private serverUrl: string) {}
 
+    get baseUrl(): string {
+        return this.serverUrl;
+    }
+
     onSessionRecovered(callback: () => void | Promise<void>): () => void {
         this.onSessionRecoveredCallbacks.push(callback);
         return () => {
@@ -210,6 +214,52 @@ export class HttpMcpClient {
         });
     }
 
+    private async httpRequestRaw(
+        method: 'GET' | 'POST',
+        path: string,
+        options?: {
+            headers?: Record<string, string | number>;
+            body?: Buffer;
+            timeoutMs?: number;
+        }
+    ): Promise<{ statusCode: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+        return new Promise((resolve, reject) => {
+            const url = new URL(this.serverUrl + path);
+            const isHttps = url.protocol === 'https:';
+            const client = isHttps ? https : http;
+            const req = client.request(
+                {
+                    hostname: url.hostname,
+                    port: url.port || (isHttps ? 443 : 80),
+                    path: url.pathname + url.search,
+                    method,
+                    headers: options?.headers || {},
+                },
+                (res) => {
+                    const chunks: Buffer[] = [];
+                    res.on('data', (chunk: Buffer) => chunks.push(chunk));
+                    res.on('end', () => {
+                        const body = Buffer.concat(chunks);
+                        const statusCode = res.statusCode || 0;
+                        if (statusCode < 200 || statusCode >= 300) {
+                            reject(new Error(`HTTP ${statusCode}: ${body.toString('utf8')}`));
+                            return;
+                        }
+                        resolve({ statusCode, headers: res.headers, body });
+                    });
+                }
+            );
+            req.on('error', reject);
+            req.setTimeout(options?.timeoutMs ?? 30000, () => {
+                req.destroy(new Error(`HTTP ${method} ${path} timed out`));
+            });
+            if (options?.body) {
+                req.write(options.body);
+            }
+            req.end();
+        });
+    }
+
     private isSessionError(error?: unknown, message?: string): boolean {
         if (error instanceof Error && error.message.includes('HTTP 404')) {
             return true;
@@ -247,10 +297,27 @@ export class HttpMcpClient {
     }
 
     async listPlans(filter?: 'all' | 'active' | 'done' | 'hold'): Promise<any> {
+        return await this.listPlansWithWorkspace(filter, undefined);
+    }
+
+    async listPlansWithWorkspace(
+        filter?: 'all' | 'active' | 'done' | 'hold',
+        workspaceId?: string
+    ): Promise<any> {
         return await this.sendRequest('tools/call', {
             name: 'riotplan_list_plans',
-            arguments: { filter },
+            arguments: {
+                ...(filter ? { filter } : {}),
+                ...(workspaceId ? { workspaceId } : {}),
+            },
         });
+    }
+
+    async listPlansFiltered(
+        filter?: 'all' | 'active' | 'done' | 'hold',
+        workspaceId?: string
+    ): Promise<any> {
+        return this.listPlansWithWorkspace(filter, workspaceId);
     }
 
     async movePlan(
@@ -261,6 +328,72 @@ export class HttpMcpClient {
             name: 'riotplan_plan',
             arguments: { action: 'move', planId, target },
         });
+    }
+
+    async createPlan(args: {
+        code: string;
+        description: string;
+        name?: string;
+        steps?: number;
+    }): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_plan',
+            arguments: {
+                action: 'create',
+                code: args.code,
+                description: args.description,
+                ...(args.name ? { name: args.name } : {}),
+                ...(typeof args.steps === 'number' ? { steps: args.steps } : {}),
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            try {
+                return JSON.parse(result.content[0].text);
+            } catch {
+                return result.content[0].text;
+            }
+        }
+        return result;
+    }
+
+    async downloadPlanFile(planId: string): Promise<{ filename: string; content: Buffer }> {
+        const response = await this.httpRequestRaw('GET', `/plan/${encodeURIComponent(planId)}`, {
+            headers: { Accept: 'application/octet-stream' },
+            timeoutMs: 120000,
+        });
+        const disposition = String(response.headers['content-disposition'] || '');
+        const match = disposition.match(/filename="?([^";]+)"?/i);
+        const filename = match?.[1] || `${planId}.plan`;
+        return { filename, content: response.body };
+    }
+
+    async uploadPlanFile(filename: string, content: Buffer): Promise<any> {
+        const boundary = `----riotplan-vscode-${Date.now().toString(16)}`;
+        const preamble = Buffer.from(
+            `--${boundary}\r\n` +
+                `Content-Disposition: form-data; name="plan"; filename="${filename}"\r\n` +
+                `Content-Type: application/octet-stream\r\n\r\n`,
+            'utf8'
+        );
+        const epilogue = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
+        const body = Buffer.concat([preamble, content, epilogue]);
+
+        const response = await this.httpRequestRaw('POST', '/plan/upload', {
+            headers: {
+                'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                'Content-Length': body.byteLength,
+                Accept: 'application/json',
+            },
+            body,
+            timeoutMs: 120000,
+        });
+
+        const text = response.body.toString('utf8');
+        try {
+            return JSON.parse(text);
+        } catch {
+            return { success: true, raw: text };
+        }
     }
 
     private async callToolWithArgFallback(
@@ -295,6 +428,107 @@ export class HttpMcpClient {
             return JSON.parse(result.content[0].text);
         }
         return result;
+    }
+
+    async bindProject(planId: string, project: Record<string, unknown>): Promise<any> {
+        return await this.sendRequest('tools/call', {
+            name: 'riotplan_bind_project',
+            arguments: { planId, project },
+        });
+    }
+
+    async getProjectBinding(planId: string): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_get_project_binding',
+            arguments: { planId },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    async resolveProjectContext(planId: string, cwd?: string): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_resolve_project_context',
+            arguments: {
+                planId,
+                ...(cwd ? { cwd } : {}),
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    async listContextProjects(includeInactive = true): Promise<any[]> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_context',
+            arguments: {
+                action: 'list',
+                entityType: 'project',
+                includeInactive,
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            const data = JSON.parse(result.content[0].text);
+            if (Array.isArray(data?.entities)) {
+                return data.entities;
+            }
+            // Backward/variant compatibility: some builds return projects directly or nested in data.
+            if (Array.isArray(data?.projects)) {
+                return data.projects;
+            }
+            if (Array.isArray(data?.data?.entities)) {
+                return data.data.entities;
+            }
+            if (Array.isArray(data?.data?.projects)) {
+                return data.data.projects;
+            }
+            if (Array.isArray(data)) {
+                return data;
+            }
+            return [];
+        }
+        return [];
+    }
+
+    async createContextProject(entity: Record<string, unknown>): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_context',
+            arguments: {
+                action: 'create',
+                entityType: 'project',
+                entity,
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    async getContextProject(id: string): Promise<any | null> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_context',
+            arguments: {
+                action: 'get',
+                entityType: 'project',
+                id,
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            const data = JSON.parse(result.content[0].text);
+            if (data?.entity) {
+                return data.entity;
+            }
+            if (data?.data?.entity) {
+                return data.data.entity;
+            }
+            return null;
+        }
+        return null;
     }
 
     async readContext(planPath: string): Promise<any> {
