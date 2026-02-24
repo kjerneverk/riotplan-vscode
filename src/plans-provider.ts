@@ -10,10 +10,14 @@ import { HttpMcpClient } from './mcp-client';
 type PlanCategory = 'active' | 'done' | 'hold';
 const TREE_MIME = 'application/vnd.code.tree.riotplan-plans';
 
+type PlanCategory = 'active' | 'done' | 'hold';
+const TREE_MIME = 'application/vnd.code.tree.riotplan-plans';
+
 export class PlanItem extends vscode.TreeItem {
     constructor(
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
+        public readonly category?: PlanCategory,
         public readonly category?: PlanCategory,
         public readonly path?: string,
         public readonly uuid?: string,
@@ -38,6 +42,8 @@ export class PlanItem extends vscode.TreeItem {
             if (progress) {
                 this.description = `${stage} - ${progress.percentage}%`;
             }
+        } else if (category) {
+            this.contextValue = 'plan-category';
         } else if (category) {
             this.contextValue = 'plan-category';
         }
@@ -73,13 +79,18 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
                 new PlanItem('Active', vscode.TreeItemCollapsibleState.Expanded, 'active'),
                 new PlanItem('Done', vscode.TreeItemCollapsibleState.Collapsed, 'done'),
                 new PlanItem('Hold', vscode.TreeItemCollapsibleState.Collapsed, 'hold'),
+                new PlanItem('Active', vscode.TreeItemCollapsibleState.Expanded, 'active'),
+                new PlanItem('Done', vscode.TreeItemCollapsibleState.Collapsed, 'done'),
+                new PlanItem('Hold', vscode.TreeItemCollapsibleState.Collapsed, 'hold'),
             ];
         }
 
         // Category level - show plans
         const category = this.resolveCategoryFromLabel(element.label);
+        const category = this.resolveCategoryFromLabel(element.label);
 
         try {
+            const plans = await this.fetchPlans(category);
             const plans = await this.fetchPlans(category);
 
             return plans.map(
@@ -87,6 +98,7 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
                     new PlanItem(
                         plan.name || plan.title || plan.id,
                         vscode.TreeItemCollapsibleState.None,
+                        category,
                         category,
                         plan.path,
                         plan.uuid,
@@ -135,8 +147,10 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
             return;
         }
 
-        const raw = transferItem.value;
-        const rawText = typeof raw === 'string' ? raw : String(raw ?? '');
+        const rawText = await this.readTransferText(transferItem);
+        if (!rawText) {
+            return;
+        }
         let dragged: Array<{
             path?: string;
             uuid?: string;
@@ -175,7 +189,8 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         }
 
         if (moved.length > 0) {
-            const categoryName = targetCategory === 'done' ? 'Done' : 'Hold';
+            const categoryName =
+                targetCategory === 'done' ? 'Done' : targetCategory === 'hold' ? 'Hold' : 'Active';
             vscode.window.showInformationMessage(
                 `Moved ${moved.length} plan${moved.length === 1 ? '' : 's'} to ${categoryName}.`
             );
@@ -231,11 +246,11 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         return 'active';
     }
 
-    private resolveDropCategory(target: PlanItem | undefined): 'done' | 'hold' | undefined {
+    private resolveDropCategory(target: PlanItem | undefined): PlanCategory | undefined {
         if (!target?.category) {
             return undefined;
         }
-        if (target.category === 'done' || target.category === 'hold') {
+        if (target.category === 'active' || target.category === 'done' || target.category === 'hold') {
             return target.category;
         }
         return undefined;
@@ -243,7 +258,7 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
 
     private async movePlanViaMcp(
         item: { path?: string; uuid?: string; planId: string },
-        destinationCategory: 'done' | 'hold'
+        destinationCategory: PlanCategory
     ): Promise<void> {
         const candidates = [item.path, item.uuid, item.planId].filter(
             (candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0
@@ -283,6 +298,24 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
 
         if (lastError) {
             throw lastError;
+        }
+    }
+
+    private async readTransferText(transferItem: vscode.DataTransferItem): Promise<string | undefined> {
+        try {
+            const raw = transferItem.value;
+            if (typeof raw === 'string' && raw.length > 0) {
+                return raw;
+            }
+        } catch {
+            // Some VS Code versions/sources only expose data through asString().
+        }
+
+        try {
+            const text = await transferItem.asString();
+            return typeof text === 'string' && text.length > 0 ? text : undefined;
+        } catch {
+            return undefined;
         }
     }
 }
