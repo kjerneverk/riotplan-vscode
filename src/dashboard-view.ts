@@ -9,6 +9,9 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import { HttpMcpClient } from './mcp-client';
+import { UNASSIGNED_PROJECT_FILTER, type PlanSortOrder } from './plans-provider';
+
+type PlanCategory = 'active' | 'done' | 'hold';
 
 interface WebviewMessage {
     type: string;
@@ -26,6 +29,14 @@ interface PlanSummary {
     status: string;
     progress?: { completed: number; total: number; percentage: number };
     lastUpdated?: string;
+    category?: PlanCategory;
+    project?: { id?: string; name?: string };
+}
+
+interface DashboardFilterState {
+    projectFilter?: string;
+    statuses: PlanCategory[];
+    sortOrder: PlanSortOrder;
 }
 
 export class DashboardViewProvider {
@@ -36,6 +47,10 @@ export class DashboardViewProvider {
     private _unsubscribeNotification?: () => void;
     private _watchdogTimer?: ReturnType<typeof setInterval>;
     private _debounceTimer?: ReturnType<typeof setTimeout>;
+    private _filters: DashboardFilterState = {
+        statuses: ['active', 'done', 'hold'],
+        sortOrder: 'name-asc',
+    };
 
     constructor(private readonly _extensionUri: vscode.Uri) {}
 
@@ -107,6 +122,17 @@ export class DashboardViewProvider {
         await this._refreshData();
     }
 
+    setFilters(next: DashboardFilterState): void {
+        this._filters = {
+            projectFilter: next.projectFilter?.trim().toLowerCase() || undefined,
+            statuses: next.statuses.length > 0 ? [...next.statuses] : ['active', 'done', 'hold'],
+            sortOrder: next.sortOrder,
+        };
+        if (this._panel?.visible) {
+            void this._refreshData();
+        }
+    }
+
     private _startWatchdog(): void {
         this._clearWatchdog();
         this._watchdogTimer = setInterval(() => {
@@ -161,17 +187,17 @@ export class DashboardViewProvider {
 
     private async _fetchPlans(): Promise<{
         totalCount: number;
-        stages: Array<{ stage: string; plans: PlanSummary[] }>;
+        dateGroups: Array<{ dayKey: string; label: string; plans: PlanSummary[]; sortValue: number }>;
     }> {
         if (!this._mcpClient) {
-            return { totalCount: 0, stages: [] };
+            return { totalCount: 0, dateGroups: [] };
         }
 
         try {
             const result = await this._mcpClient.listPlans('all');
             const plansData = result?.content?.[0]?.text;
             if (!plansData) {
-                return { totalCount: 0, stages: [] };
+                return { totalCount: 0, dateGroups: [] };
             }
 
             const parsed = JSON.parse(plansData);
@@ -180,53 +206,25 @@ export class DashboardViewProvider {
                 uuid: p.uuid,
                 id: p.id,
                 path: p.path || p.code,
-                code: p.code || p.id || p.uuid || 'plan',
-                name: p.name || p.code || p.id || p.uuid || 'Untitled Plan',
+                code: toSafePlanCode(p),
+                name: resolvePlanTitle(p),
                 stage: normalizeStage(p.stage),
                 status: normalizeStatus(p.status, p.stage),
                 progress: p.progress,
                 lastUpdated: p.lastUpdated || p.updatedAt || p.createdAt,
-            }));
+                category: getPlanCategory(p),
+                project: p.project,
+            }))
+                .filter((plan: PlanSummary) => this._matchesProjectFilter(plan))
+                .filter((plan: PlanSummary) => this._filters.statuses.includes(plan.category || 'active'));
 
-            const stageOrder = ['idea', 'shaping', 'built', 'executing', 'done', 'cancelled'];
-            const stageMap = new Map<string, PlanSummary[]>();
+            const sorted = [...plans].sort((a, b) => this._comparePlans(a, b));
+            const grouped = groupPlansByDay(sorted);
 
-            for (const plan of plans) {
-                const stage = plan.stage.toLowerCase();
-                if (!stageMap.has(stage)) {
-                    stageMap.set(stage, []);
-                }
-                stageMap.get(stage)!.push(plan);
-            }
-
-            const stages = stageOrder
-                .filter((s) => stageMap.has(s))
-                .map((s) => ({
-                    stage: s,
-                    plans: stageMap.get(s)!.sort((a, b) => {
-                        const aTime = a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0;
-                        const bTime = b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0;
-                        return bTime - aTime;
-                    }),
-                }));
-
-            for (const [stage, planList] of stageMap.entries()) {
-                if (!stageOrder.includes(stage)) {
-                    stages.push({
-                        stage,
-                        plans: planList.sort((a, b) => {
-                            const aTime = a.lastUpdated ? new Date(a.lastUpdated).getTime() : 0;
-                            const bTime = b.lastUpdated ? new Date(b.lastUpdated).getTime() : 0;
-                            return bTime - aTime;
-                        }),
-                    });
-                }
-            }
-
-            return { totalCount: plans.length, stages };
+            return { totalCount: plans.length, dateGroups: grouped };
         } catch (err) {
             console.error('RiotPlan: [DASHBOARD] Failed to fetch plans:', err);
-            return { totalCount: 0, stages: [] };
+            return { totalCount: 0, dateGroups: [] };
         }
     }
 
@@ -243,8 +241,52 @@ export class DashboardViewProvider {
                 break;
 
             case 'create-plan':
-                await vscode.commands.executeCommand('riotplan.createPlan');
+                await vscode.commands.executeCommand('riotplan.addPlan');
                 break;
+
+            case 'filter':
+                await vscode.commands.executeCommand('riotplan.filterPlansByProject');
+                break;
+
+            case 'filter-status':
+                await vscode.commands.executeCommand('riotplan.filterPlansByStatus');
+                break;
+        }
+    }
+
+    private _matchesProjectFilter(plan: PlanSummary): boolean {
+        if (!this._filters.projectFilter) {
+            return true;
+        }
+        if (this._filters.projectFilter === UNASSIGNED_PROJECT_FILTER) {
+            return !hasAssignedProject(plan);
+        }
+        const needle = this._filters.projectFilter;
+        const projectId = String(plan.project?.id || '').toLowerCase();
+        const projectName = String(plan.project?.name || '').toLowerCase();
+        return projectId.includes(needle) || projectName.includes(needle);
+    }
+
+    private _comparePlans(left: PlanSummary, right: PlanSummary): number {
+        const leftName = String(left?.name || '').toLowerCase();
+        const rightName = String(right?.name || '').toLowerCase();
+        const leftStage = String(left?.stage || '').toLowerCase();
+        const rightStage = String(right?.stage || '').toLowerCase();
+        const leftProgress = Number(left?.progress?.percentage ?? 0);
+        const rightProgress = Number(right?.progress?.percentage ?? 0);
+
+        switch (this._filters.sortOrder) {
+            case 'name-desc':
+                return rightName.localeCompare(leftName);
+            case 'stage-asc':
+                return leftStage.localeCompare(rightStage) || leftName.localeCompare(rightName);
+            case 'progress-desc':
+                return rightProgress - leftProgress || leftName.localeCompare(rightName);
+            case 'progress-asc':
+                return leftProgress - rightProgress || leftName.localeCompare(rightName);
+            case 'name-asc':
+            default:
+                return leftName.localeCompare(rightName);
         }
     }
 
@@ -325,39 +367,33 @@ export class DashboardViewProvider {
       margin-left: 12px;
     }
 
-    .stage-section {
+    .date-section {
       margin-bottom: 24px;
     }
 
-    .stage-header {
+    .date-header {
       display: flex;
       align-items: center;
       gap: 10px;
       margin-bottom: 12px;
       padding: 8px 12px;
       border-radius: 6px;
+      background: var(--vscode-editor-inactiveSelectionBackground, rgba(128,128,128,.12));
     }
 
-    .stage-header h2 {
+    .date-header h2 {
       font-size: 14px;
       font-weight: 600;
-      text-transform: capitalize;
       margin: 0;
     }
 
-    .stage-count {
+    .date-count {
       font-size: 11px;
       padding: 2px 8px;
       border-radius: 10px;
-      background: rgba(255,255,255,0.15);
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
     }
-
-    .stage-idea .stage-header { background: rgba(79, 195, 247, 0.15); color: #4fc3f7; }
-    .stage-shaping .stage-header { background: rgba(206, 147, 216, 0.15); color: #ce93d8; }
-    .stage-built .stage-header { background: rgba(255, 183, 77, 0.15); color: #ffb74d; }
-    .stage-executing .stage-header { background: rgba(255, 241, 118, 0.15); color: #fff176; }
-    .stage-done .stage-header { background: rgba(129, 199, 132, 0.15); color: #81c784; }
-    .stage-cancelled .stage-header { background: rgba(229, 115, 115, 0.15); color: #e57373; }
 
     .plans-table {
       width: 100%;
@@ -395,12 +431,6 @@ export class DashboardViewProvider {
       color: var(--vscode-editor-foreground);
     }
 
-    .plan-code {
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
-      color: var(--vscode-descriptionForeground);
-    }
-
     .progress-bar {
       width: 100px;
       height: 6px;
@@ -432,6 +462,17 @@ export class DashboardViewProvider {
       color: var(--vscode-descriptionForeground);
     }
 
+    .stage-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 500;
+      text-transform: capitalize;
+      color: var(--vscode-editor-foreground);
+    }
+
     .empty-state {
       text-align: center;
       padding: 48px 24px;
@@ -460,6 +501,8 @@ export class DashboardViewProvider {
         <span class="total-badge" id="total-count">0 plans</span>
       </div>
       <div class="header-actions">
+        <button class="btn btn-secondary" id="filter-btn" title="Filter by project">⛃ Filter</button>
+        <button class="btn btn-secondary" id="filter-status-btn" title="Filter by status">☰ Status</button>
         <button class="btn btn-secondary" id="refresh-btn" title="Refresh data">↺ Refresh</button>
         <button class="btn" id="create-btn" title="Create a new plan">+ New Plan</button>
       </div>
@@ -475,6 +518,12 @@ export class DashboardViewProvider {
 
     document.getElementById('refresh-btn').addEventListener('click', () => {
       vscode.postMessage({ type: 'refresh' });
+    });
+    document.getElementById('filter-btn').addEventListener('click', () => {
+      vscode.postMessage({ type: 'filter' });
+    });
+    document.getElementById('filter-status-btn').addEventListener('click', () => {
+      vscode.postMessage({ type: 'filter-status' });
     });
 
     document.getElementById('create-btn').addEventListener('click', () => {
@@ -525,26 +574,26 @@ export class DashboardViewProvider {
       totalBadge.textContent = data.totalCount + ' plan' + (data.totalCount === 1 ? '' : 's');
 
       let html = '';
-      const stages = Array.isArray(data.stages) ? data.stages : [];
-      for (const stageGroup of stages) {
-        const plans = Array.isArray(stageGroup.plans) ? stageGroup.plans : [];
-        const stageClass = 'stage-' + stageGroup.stage;
-        const stageColor = STAGE_COLORS[stageGroup.stage] || '#9e9e9e';
+      const dateGroups = Array.isArray(data.dateGroups) ? data.dateGroups : [];
+      for (const dayGroup of dateGroups) {
+        const plans = Array.isArray(dayGroup.plans) ? dayGroup.plans : [];
 
-        html += '<div class="stage-section ' + stageClass + '">';
-        html += '<div class="stage-header">';
-        html += '<h2>' + stageGroup.stage + '</h2>';
-        html += '<span class="stage-count">' + plans.length + '</span>';
+        html += '<div class="date-section">';
+        html += '<div class="date-header">';
+        html += '<h2>' + escapeHtml(dayGroup.label || 'Unknown date') + '</h2>';
+        html += '<span class="date-count">' + plans.length + '</span>';
         html += '</div>';
 
         html += '<table class="plans-table">';
-        html += '<thead><tr><th>Plan</th><th>Progress</th><th>Updated</th></tr></thead>';
+        html += '<thead><tr><th>Plan</th><th>Stage</th><th>Progress</th><th>Updated</th></tr></thead>';
         html += '<tbody>';
 
         for (const plan of plans) {
           const planRef = plan.ref || plan.uuid || plan.id || plan.path || plan.code || plan.name || '';
           const pct = plan.progress ? plan.progress.percentage : 0;
-          const progressClass = 'progress-' + stageGroup.stage;
+          const normalizedStage = String(plan.stage || '').toLowerCase();
+          const progressClass = 'progress-' + normalizedStage;
+          const stageColor = STAGE_COLORS[normalizedStage] || '#9e9e9e';
 
           html += '<tr class="plan-row"';
           if (planRef) {
@@ -554,8 +603,9 @@ export class DashboardViewProvider {
 
           html += '<td>';
           html += '<div class="plan-name">' + escapeHtml(plan.name) + '</div>';
-          html += '<div class="plan-code">' + escapeHtml(plan.code) + '</div>';
           html += '</td>';
+
+          html += '<td><span class="stage-pill" style="background:' + escapeAttr(stageColor + '33') + ';border:1px solid ' + escapeAttr(stageColor + '80') + ';">' + escapeHtml(plan.stage || 'unknown') + '</span></td>';
 
           html += '<td>';
           if (plan.progress && plan.progress.total > 0) {
@@ -611,6 +661,91 @@ export class DashboardViewProvider {
     }
 }
 
+function resolvePlanTitle(plan: any): string {
+    const direct = firstNonEmptyString(plan?.title, plan?.name);
+    if (direct) {
+        return stripUuidPrefix(direct);
+    }
+    const fallback = firstNonEmptyString(plan?.code, plan?.id, plan?.path);
+    if (fallback) {
+        return stripUuidPrefix(basename(fallback));
+    }
+    return 'Untitled Plan';
+}
+
+function toSafePlanCode(plan: any): string {
+    const raw = firstNonEmptyString(plan?.code, plan?.id, plan?.path);
+    if (!raw) {
+        return 'plan';
+    }
+    return stripUuidPrefix(basename(raw));
+}
+
+function groupPlansByDay(
+    plans: PlanSummary[]
+): Array<{ dayKey: string; label: string; plans: PlanSummary[]; sortValue: number }> {
+    const groups = new Map<string, { dayKey: string; label: string; plans: PlanSummary[]; sortValue: number }>();
+
+    for (const plan of plans) {
+        const modifiedAt = parsePlanModifiedDate(plan.lastUpdated);
+        const dayKey = modifiedAt ? toLocalDayKey(modifiedAt) : 'unknown';
+        const label = modifiedAt ? formatDayLabel(modifiedAt) : 'Unknown date';
+        const sortValue = modifiedAt ? toDaySortValue(modifiedAt) : Number.NEGATIVE_INFINITY;
+        const current = groups.get(dayKey) || { dayKey, label, plans: [], sortValue };
+        current.plans.push(plan);
+        current.sortValue = Math.max(current.sortValue, sortValue);
+        groups.set(dayKey, current);
+    }
+
+    return [...groups.values()].sort((left, right) => right.sortValue - left.sortValue);
+}
+
+function parsePlanModifiedDate(value: unknown): Date | undefined {
+    if (typeof value !== 'string' || !value.trim()) {
+        return undefined;
+    }
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+function toLocalDayKey(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function toDaySortValue(date: Date): number {
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+function formatDayLabel(date: Date): string {
+    return new Intl.DateTimeFormat(undefined, {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+    }).format(date);
+}
+
+function firstNonEmptyString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim();
+        }
+    }
+    return undefined;
+}
+
+function basename(value: string): string {
+    const parts = value.split(/[\\/]+/).filter(Boolean);
+    return parts.length > 0 ? parts[parts.length - 1] : value;
+}
+
+function stripUuidPrefix(value: string): string {
+    return value.replace(/^[0-9a-f]{8,}-/i, '').trim() || value;
+}
+
 function normalizeStage(stage: unknown): string {
     if (typeof stage !== 'string' || !stage.trim()) {
         return 'unknown';
@@ -630,4 +765,26 @@ function normalizeStatus(status: unknown, stage: unknown): string {
         return stage;
     }
     return 'unknown';
+}
+
+function getPlanCategory(plan: any): PlanCategory {
+    const explicitCategory = typeof plan?.category === 'string' ? plan.category.toLowerCase() : '';
+    if (explicitCategory === 'done' || explicitCategory === 'hold' || explicitCategory === 'active') {
+        return explicitCategory;
+    }
+    const planPath = typeof plan?.path === 'string' ? plan.path : '';
+    const parts = planPath.split(/[\\/]+/).map((segment: string) => segment.toLowerCase());
+    if (parts.includes('done')) {
+        return 'done';
+    }
+    if (parts.includes('hold')) {
+        return 'hold';
+    }
+    return 'active';
+}
+
+function hasAssignedProject(plan: PlanSummary): boolean {
+    const projectId = String(plan.project?.id || '').trim();
+    const projectName = String(plan.project?.name || '').trim();
+    return projectId.length > 0 || projectName.length > 0;
 }

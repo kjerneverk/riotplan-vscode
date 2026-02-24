@@ -7,7 +7,9 @@
 import * as vscode from 'vscode';
 import { HttpMcpClient } from './mcp-client';
 
-type PlanCategory = 'active' | 'done' | 'hold';
+export type PlanCategory = 'active' | 'done' | 'hold';
+export type PlanSortOrder = 'name-asc' | 'name-desc' | 'stage-asc' | 'progress-desc' | 'progress-asc';
+export const UNASSIGNED_PROJECT_FILTER = '__riotplan_unassigned__';
 const TREE_MIME = 'application/vnd.code.tree.riotplan-plans';
 
 export class PlanItem extends vscode.TreeItem {
@@ -15,19 +17,22 @@ export class PlanItem extends vscode.TreeItem {
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
         public readonly category?: PlanCategory,
+        public readonly dayKey?: string,
         public readonly path?: string,
         public readonly uuid?: string,
         public readonly planId?: string,
         public readonly stage?: string,
         public readonly progress?: { completed: number; total: number; percentage: number },
-        public readonly project?: any
+        public readonly project?: any,
+        public readonly itemCount?: number
     ) {
         super(label, collapsibleState);
 
         if (path || uuid || planId) {
-            const idSuffix = planId || uuid;
-            this.tooltip = idSuffix ? `${label} (${idSuffix.substring(0, 8)})` : label;
-            this.description = stage;
+            this.tooltip = label;
+            const projectLabel = project?.name || project?.id || 'Unassigned';
+            this.description = projectLabel;
+            this.iconPath = stageThemeIcon(stage);
             this.contextValue = 'plan';
             this.command = {
                 command: 'riotplan.openPlan',
@@ -36,10 +41,19 @@ export class PlanItem extends vscode.TreeItem {
             };
 
             if (progress) {
-                this.description = `${stage} - ${progress.percentage}%`;
+                this.description = `${progress.percentage}% · ${projectLabel}`;
+            }
+        } else if (category && dayKey) {
+            this.contextValue = 'plan-day-group';
+            this.iconPath = new vscode.ThemeIcon('history');
+            if (typeof itemCount === 'number' && itemCount > 0) {
+                this.description = String(itemCount);
             }
         } else if (category) {
             this.contextValue = 'plan-category';
+            if (typeof itemCount === 'number' && itemCount > 0) {
+                this.description = String(itemCount);
+            }
         }
     }
 }
@@ -51,6 +65,9 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         this._onDidChangeTreeData.event;
     readonly dragMimeTypes = [TREE_MIME];
     readonly dropMimeTypes = [TREE_MIME];
+    private projectFilter: string | undefined;
+    private visibleCategories: Set<PlanCategory> = new Set(['active', 'done', 'hold']);
+    private sortOrder: PlanSortOrder = 'name-asc';
 
     constructor(private mcpClient: HttpMcpClient) {}
 
@@ -62,38 +79,115 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         this._onDidChangeTreeData.fire();
     }
 
+    setProjectFilter(value: string | undefined): void {
+        this.projectFilter = value?.trim().toLowerCase() || undefined;
+        this.refresh();
+    }
+
+    setStatusFilter(categories: PlanCategory[]): void {
+        if (categories.length === 0) {
+            this.visibleCategories = new Set(['active', 'done', 'hold']);
+        } else {
+            this.visibleCategories = new Set(categories);
+        }
+        this.refresh();
+    }
+
+    setSortOrder(order: PlanSortOrder): void {
+        this.sortOrder = order;
+        this.refresh();
+    }
+
+    getProjectFilter(): string | undefined {
+        return this.projectFilter;
+    }
+
+    getStatusFilter(): PlanCategory[] {
+        return [...this.visibleCategories];
+    }
+
+    getSortOrder(): PlanSortOrder {
+        return this.sortOrder;
+    }
+
     getTreeItem(element: PlanItem): vscode.TreeItem {
         return element;
     }
 
     async getChildren(element?: PlanItem): Promise<PlanItem[]> {
         if (!element) {
-            // Root level - show categories
-            return [
-                new PlanItem('Active', vscode.TreeItemCollapsibleState.Expanded, 'active'),
-                new PlanItem('Done', vscode.TreeItemCollapsibleState.Collapsed, 'done'),
-                new PlanItem('Hold', vscode.TreeItemCollapsibleState.Collapsed, 'hold'),
+            // Root level - show categories based on status filter.
+            const categories: Array<{ label: string; category: PlanCategory }> = [
+                { label: 'Active', category: 'active' },
+                { label: 'Done', category: 'done' },
+                { label: 'Hold', category: 'hold' },
             ];
+            const visible = categories.filter((entry) => this.visibleCategories.has(entry.category));
+            if (visible.length === 0) {
+                return [];
+            }
+            const categoryCounts = await Promise.all(
+                visible.map(async (entry) => ({
+                    ...entry,
+                    count: (await this.fetchPlans(entry.category)).length,
+                }))
+            );
+            return categoryCounts.map(
+                (entry, index) =>
+                    new PlanItem(
+                        entry.label,
+                        index === 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed,
+                        entry.category,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        entry.count
+                    )
+            );
         }
 
-        // Category level - show plans
-        const category = this.resolveCategoryFromLabel(element.label);
+        // Day-group level - show plans for the selected day bucket.
+        if (element.contextValue === 'plan-day-group' && element.category && element.dayKey) {
+            try {
+                const category = element.category;
+                const plans = await this.fetchPlans(category);
+                const groups = this.groupPlansByDay(plans);
+                const group = groups.find((entry) => entry.dayKey === element.dayKey);
+                if (!group) {
+                    return [];
+                }
+                return group.plans.map((plan: any) => this.toPlanItem(plan, category));
+            } catch (error) {
+                console.error('Failed to load plans:', error);
+                return [];
+            }
+        }
+
+        // Category level - show day groups.
+        const category = element.category || this.resolveCategoryFromLabel(element.label);
 
         try {
             const plans = await this.fetchPlans(category);
 
-            return plans.map(
-                (plan: any) =>
+            const groups = this.groupPlansByDay(plans);
+            return groups.map(
+                (group, index) =>
                     new PlanItem(
-                        plan.name || plan.title || plan.id,
-                        vscode.TreeItemCollapsibleState.None,
+                        group.label,
+                        index === 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed,
                         category,
-                        plan.path,
-                        plan.uuid,
-                        plan.planId || plan.id,
-                        plan.stage,
-                        plan.progress,
-                        plan.project
+                        group.dayKey,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        undefined,
+                        group.plans.length
                     )
             );
         } catch (error) {
@@ -204,7 +298,153 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         }
         const data = JSON.parse(content.text);
         const plans = data.plans || [];
-        return plans.filter((plan: any) => this.getPlanCategory(plan) === category);
+        return plans
+            .filter((plan: any) => this.getPlanCategory(plan) === category)
+            .filter((plan: any) => this.matchesProjectFilter(plan))
+            .sort((left: any, right: any) => this.comparePlans(left, right));
+    }
+
+    private matchesProjectFilter(plan: any): boolean {
+        if (!this.projectFilter) {
+            return true;
+        }
+        if (this.projectFilter === UNASSIGNED_PROJECT_FILTER) {
+            return !hasAssignedProject(plan);
+        }
+        const projectId = String(plan?.project?.id || '').toLowerCase();
+        const projectName = String(plan?.project?.name || '').toLowerCase();
+        return projectId.includes(this.projectFilter) || projectName.includes(this.projectFilter);
+    }
+
+    private comparePlans(left: any, right: any): number {
+        const leftName = this.resolvePlanTitle(left).toLowerCase();
+        const rightName = this.resolvePlanTitle(right).toLowerCase();
+        const leftStage = String(left?.stage || '').toLowerCase();
+        const rightStage = String(right?.stage || '').toLowerCase();
+        const leftProgress = Number(left?.progress?.percentage ?? 0);
+        const rightProgress = Number(right?.progress?.percentage ?? 0);
+
+        switch (this.sortOrder) {
+            case 'name-desc':
+                return rightName.localeCompare(leftName);
+            case 'stage-asc': {
+                const stageOrder = leftStage.localeCompare(rightStage);
+                return stageOrder !== 0 ? stageOrder : leftName.localeCompare(rightName);
+            }
+            case 'progress-desc':
+                return rightProgress - leftProgress || leftName.localeCompare(rightName);
+            case 'progress-asc':
+                return leftProgress - rightProgress || leftName.localeCompare(rightName);
+            case 'name-asc':
+            default:
+                return leftName.localeCompare(rightName);
+        }
+    }
+
+    private toPlanItem(plan: any, category: PlanCategory): PlanItem {
+        return new PlanItem(
+            this.resolvePlanTitle(plan),
+            vscode.TreeItemCollapsibleState.None,
+            category,
+            undefined,
+            plan.path,
+            plan.uuid,
+            plan.planId || plan.id,
+            plan.stage,
+            plan.progress,
+            plan.project
+        );
+    }
+
+    private resolvePlanTitle(plan: any): string {
+        const direct = this.firstNonEmptyString(plan?.title, plan?.name);
+        if (direct) {
+            return this.stripUuidPrefix(direct);
+        }
+        const fallback = this.firstNonEmptyString(plan?.code, plan?.id, plan?.path);
+        if (fallback) {
+            return this.stripUuidPrefix(this.basename(fallback));
+        }
+        return 'Untitled Plan';
+    }
+
+    private firstNonEmptyString(...values: unknown[]): string | undefined {
+        for (const value of values) {
+            if (typeof value === 'string' && value.trim()) {
+                return value.trim();
+            }
+        }
+        return undefined;
+    }
+
+    private basename(value: string): string {
+        const parts = value.split(/[\\/]+/).filter(Boolean);
+        return parts.length > 0 ? parts[parts.length - 1] : value;
+    }
+
+    private stripUuidPrefix(value: string): string {
+        // Common RiotPlan filename format: "094f50cc-plan-title"
+        return value.replace(/^[0-9a-f]{8,}-/i, '').trim() || value;
+    }
+
+    private groupPlansByDay(
+        plans: any[]
+    ): Array<{ dayKey: string; label: string; plans: any[]; sortValue: number }> {
+        const groups = new Map<string, { dayKey: string; label: string; plans: any[]; sortValue: number }>();
+
+        for (const plan of plans) {
+            const modifiedDate = this.getPlanModifiedDate(plan);
+            const dayKey = modifiedDate ? this.toLocalDayKey(modifiedDate) : 'unknown';
+            const label = modifiedDate ? this.formatDayLabel(modifiedDate) : 'Unknown date';
+            const sortValue = modifiedDate ? this.toDaySortValue(modifiedDate) : Number.NEGATIVE_INFINITY;
+
+            const current = groups.get(dayKey) || {
+                dayKey,
+                label,
+                plans: [],
+                sortValue,
+            };
+
+            current.plans.push(plan);
+            current.sortValue = Math.max(current.sortValue, sortValue);
+            groups.set(dayKey, current);
+        }
+
+        return [...groups.values()].sort((left, right) => right.sortValue - left.sortValue);
+    }
+
+    private getPlanModifiedDate(plan: any): Date | undefined {
+        const candidates = [plan?.lastUpdated, plan?.updatedAt, plan?.modifiedAt, plan?.mtime, plan?.createdAt];
+        for (const candidate of candidates) {
+            if (typeof candidate !== 'string' || !candidate.trim()) {
+                continue;
+            }
+            const parsed = new Date(candidate);
+            if (!Number.isNaN(parsed.getTime())) {
+                return parsed;
+            }
+        }
+        return undefined;
+    }
+
+    private toLocalDayKey(date: Date): string {
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day}`;
+    }
+
+    private toDaySortValue(date: Date): number {
+        return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+    }
+
+    private formatDayLabel(date: Date): string {
+        return new Intl.DateTimeFormat(undefined, {
+            weekday: 'long',
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+        }).format(date);
     }
 
     private resolveCategoryFromLabel(label: string): PlanCategory {
@@ -305,5 +545,31 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         } catch {
             return undefined;
         }
+    }
+}
+
+function hasAssignedProject(plan: any): boolean {
+    const projectId = String(plan?.project?.id || '').trim();
+    const projectName = String(plan?.project?.name || '').trim();
+    return projectId.length > 0 || projectName.length > 0;
+}
+
+function stageThemeIcon(stage?: string): vscode.ThemeIcon {
+    const normalized = (stage || '').toLowerCase();
+    switch (normalized) {
+        case 'completed':
+        case 'done':
+            return new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
+        case 'executing':
+            return new vscode.ThemeIcon('sync', new vscode.ThemeColor('charts.blue'));
+        case 'built':
+            return new vscode.ThemeIcon('tools', new vscode.ThemeColor('charts.green'));
+        case 'shaping':
+            return new vscode.ThemeIcon('graph', new vscode.ThemeColor('charts.yellow'));
+        case 'cancelled':
+            return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+        case 'idea':
+        default:
+            return new vscode.ThemeIcon('circle-outline', new vscode.ThemeColor('descriptionForeground'));
     }
 }
