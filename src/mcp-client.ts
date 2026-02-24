@@ -10,7 +10,7 @@ import { URL } from 'url';
 
 interface McpRequest {
     jsonrpc: '2.0';
-    id: string | number;
+    id: string | number | null;
     method: string;
     params?: any;
 }
@@ -26,13 +26,42 @@ interface McpResponse {
     };
 }
 
+function getToolErrorText(result: any): string | null {
+    if (!result || !result.isError) {
+        return null;
+    }
+    const first = result.content?.[0];
+    if (first?.type === 'text' && typeof first.text === 'string' && first.text.trim()) {
+        return first.text;
+    }
+    return 'MCP tool returned an error';
+}
+
 export class HttpMcpClient {
     private sessionId?: string;
     private initialized = false;
+    private sseConnection: http.ClientRequest | null = null;
+    private notificationHandlers: Map<string, Array<(data: unknown) => void>> = new Map();
+    private recoveringSession = false;
+    private onSessionRecoveredCallbacks: Array<() => void | Promise<void>> = [];
 
     constructor(private serverUrl: string) {}
 
+    onSessionRecovered(callback: () => void | Promise<void>): () => void {
+        this.onSessionRecoveredCallbacks.push(callback);
+        return () => {
+            const idx = this.onSessionRecoveredCallbacks.indexOf(callback);
+            if (idx >= 0) {
+                this.onSessionRecoveredCallbacks.splice(idx, 1);
+            }
+        };
+    }
+
     async sendRequest(method: string, params?: any): Promise<any> {
+        return this.sendRequestInternal(method, params, true);
+    }
+
+    private async sendRequestInternal(method: string, params: any, retryOnSessionError: boolean): Promise<any> {
         // MCP protocol requires initialize handshake before any other requests
         if (!this.initialized && method !== 'initialize') {
             await this.initialize();
@@ -45,18 +74,41 @@ export class HttpMcpClient {
             params,
         };
 
-        const response = await this.httpPost('/mcp', request);
+        try {
+            const response = await this.httpPost('/mcp', request);
 
-        // Update session ID from response headers
-        if (response.headers['mcp-session-id']) {
-            this.sessionId = response.headers['mcp-session-id'];
+            // Update session ID from response headers
+            if (response.headers['mcp-session-id']) {
+                const newSessionId = response.headers['mcp-session-id'] as string;
+                if (!this.sessionId) {
+                    this.sessionId = newSessionId;
+                    this.startSSEConnection();
+                } else {
+                    this.sessionId = newSessionId;
+                }
+            }
+
+            if (response.data.error) {
+                if (retryOnSessionError && this.isSessionError(undefined, response.data.error.message || '')) {
+                    await this.recoverSession();
+                    return this.sendRequestInternal(method, params, false);
+                }
+                throw new Error(response.data.error.message || 'MCP request failed');
+            }
+
+            const toolError = getToolErrorText(response.data.result);
+            if (toolError) {
+                throw new Error(toolError);
+            }
+
+            return response.data.result;
+        } catch (error) {
+            if (retryOnSessionError && this.isSessionError(error)) {
+                await this.recoverSession();
+                return this.sendRequestInternal(method, params, false);
+            }
+            throw error;
         }
-
-        if (response.data.error) {
-            throw new Error(response.data.error.message || 'MCP request failed');
-        }
-
-        return response.data.result;
     }
 
     private async initialize(): Promise<void> {
@@ -75,6 +127,7 @@ export class HttpMcpClient {
 
         if (response.headers['mcp-session-id']) {
             this.sessionId = response.headers['mcp-session-id'];
+            this.startSSEConnection();
         }
 
         if (response.data.error) {
@@ -82,6 +135,20 @@ export class HttpMcpClient {
         }
 
         this.initialized = true;
+        await this.sendNotification('notifications/initialized', {});
+    }
+
+    private parseSSEResponse(sseText: string): McpResponse {
+        const dataLines: string[] = [];
+        for (const line of sseText.split('\n')) {
+            if (line.startsWith('data:')) {
+                dataLines.push(line.substring(5).trim());
+            }
+        }
+        if (dataLines.length === 0) {
+            throw new Error(`No data lines found in SSE response: ${sseText.substring(0, 200)}`);
+        }
+        return JSON.parse(dataLines.join(''));
     }
 
     private async httpPost(path: string, body: any): Promise<{ data: McpResponse; headers: any }> {
@@ -115,7 +182,18 @@ export class HttpMcpClient {
 
                 res.on('end', () => {
                     try {
-                        const parsed = JSON.parse(data);
+                        if (res.statusCode === 202) {
+                            resolve({ data: { jsonrpc: '2.0', id: body.id, result: {} }, headers: res.headers });
+                            return;
+                        }
+                        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+                            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
+                            return;
+                        }
+                        const contentType = String(res.headers['content-type'] || '');
+                        const parsed = contentType.includes('text/event-stream')
+                            ? this.parseSSEResponse(data)
+                            : JSON.parse(data);
                         resolve({ data: parsed, headers: res.headers });
                     } catch (error) {
                         reject(new Error(`Failed to parse response: ${error}`));
@@ -132,10 +210,56 @@ export class HttpMcpClient {
         });
     }
 
+    private isSessionError(error?: unknown, message?: string): boolean {
+        if (error instanceof Error && error.message.includes('HTTP 404')) {
+            return true;
+        }
+        const msg = (message || '').toLowerCase();
+        return msg.includes('session not found');
+    }
+
+    private async recoverSession(): Promise<void> {
+        if (this.recoveringSession) {
+            return;
+        }
+        this.recoveringSession = true;
+        try {
+            this.sessionId = undefined;
+            this.initialized = false;
+            this.stopSSEConnection();
+            await this.initialize();
+            for (const cb of this.onSessionRecoveredCallbacks) {
+                await cb();
+            }
+        } finally {
+            this.recoveringSession = false;
+        }
+    }
+
+    private async sendNotification(method: string, params?: unknown): Promise<void> {
+        const request: McpRequest = {
+            jsonrpc: '2.0',
+            id: null,
+            method,
+            params,
+        };
+        await this.httpPost('/mcp', request);
+    }
+
     async listPlans(filter?: 'all' | 'active' | 'done' | 'hold'): Promise<any> {
         return await this.sendRequest('tools/call', {
             name: 'riotplan_list_plans',
             arguments: { filter },
+        });
+    }
+
+    async movePlan(
+        planId: string,
+        target: 'active' | 'done' | 'hold'
+    ): Promise<any> {
+        return await this.sendRequest('tools/call', {
+            name: 'riotplan_plan',
+            arguments: { action: 'move', planId, target },
         });
     }
 
@@ -185,15 +309,36 @@ export class HttpMcpClient {
         return result;
     }
 
-    async listSteps(planPath: string): Promise<any> {
-        const result = await this.sendRequest('tools/call', {
-            name: 'riotplan_step_list',
-            arguments: { path: planPath, all: true },
-        });
-        if (result?.content?.[0]?.type === 'text') {
-            try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
+    async listSteps(planPathOrId: string): Promise<Array<{
+        number: number;
+        title: string;
+        status: string;
+        file?: string;
+        startedAt?: string;
+        completedAt?: string;
+    }>> {
+        try {
+            const resource = await this.readResource(`riotplan://steps/${planPathOrId}`);
+            const parsed = JSON.parse(resource);
+            const rawSteps = Array.isArray(parsed)
+                ? parsed
+                : Array.isArray(parsed?.steps)
+                    ? parsed.steps
+                    : [];
+
+            return rawSteps
+                .map((step: any) => ({
+                    number: Number(step?.number ?? 0),
+                    title: String(step?.title ?? ''),
+                    status: String(step?.status ?? 'pending'),
+                    file: typeof step?.file === 'string' ? step.file : undefined,
+                    startedAt: typeof step?.startedAt === 'string' ? step.startedAt : undefined,
+                    completedAt: typeof step?.completedAt === 'string' ? step.completedAt : undefined,
+                }))
+                .filter((step: { number: number; title: string }) => Number.isFinite(step.number) && step.number > 0 && step.title.length > 0);
+        } catch {
+            return [];
         }
-        return result;
     }
 
     async updateStep(planId: string, step: number, status: string): Promise<any> {
@@ -230,14 +375,15 @@ export class HttpMcpClient {
         summary: string,
         content: string
     ): Promise<any> {
-        const args: any = { path: planPath, description, gatheringMethod: 'manual' };
+        const args: any = { planId: planPath, description, gatheringMethod: 'manual' };
         if (source) { args.source = source; }
         if (summary) { args.summary = summary; }
         if (content) { args.content = content; }
-        const result = await this.sendRequest('tools/call', {
-            name: 'riotplan_idea_add_evidence',
-            arguments: args,
-        });
+        const result = await this.callToolWithArgFallback(
+            'riotplan_idea',
+            { action: 'add_evidence', ...args },
+            { action: 'add_evidence', ...args, path: planPath, planId: undefined }
+        );
         if (result?.content?.[0]?.type === 'text') {
             try { return JSON.parse(result.content[0].text); } catch { return result.content[0].text; }
         }
@@ -246,9 +392,9 @@ export class HttpMcpClient {
 
     async setIdeaContent(planPathOrId: string, content: string): Promise<any> {
         const result = await this.callToolWithArgFallback(
-            'riotplan_idea_set_content',
-            { planId: planPathOrId, content },
-            { path: planPathOrId, content }
+            'riotplan_idea',
+            { action: 'set_content', planId: planPathOrId, content },
+            { action: 'set_content', path: planPathOrId, content }
         );
         if (result?.content?.[0]?.type === 'text') {
             try {
@@ -283,5 +429,172 @@ export class HttpMcpClient {
         } catch {
             return false;
         }
+    }
+
+    async getStepContent(planPathOrId: string, stepNumber: number): Promise<string> {
+        const resource = await this.readResource(`riotplan://step/${planPathOrId}?number=${stepNumber}`);
+        try {
+            const parsed = JSON.parse(resource);
+            return parsed.content || '';
+        } catch {
+            return resource;
+        }
+    }
+
+    async getEvidenceContent(planPathOrId: string, filename: string): Promise<string> {
+        const resource = await this.readResource(`riotplan://evidence-file/${planPathOrId}?file=${encodeURIComponent(filename)}`);
+        try {
+            const parsed = JSON.parse(resource);
+            return parsed.content || '';
+        } catch {
+            return resource;
+        }
+    }
+
+    async getArtifact(planPathOrId: string, type: string): Promise<{ type: string; filename: string; content: string | null; updatedAt?: string }> {
+        const resource = await this.readResource(`riotplan://artifact/${planPathOrId}?type=${encodeURIComponent(type)}`);
+        try {
+            return JSON.parse(resource);
+        } catch {
+            return { type, filename: `${type.toUpperCase()}.md`, content: null };
+        }
+    }
+
+    async getShaping(planPathOrId: string): Promise<any> {
+        const resource = await this.readResource(`riotplan://shaping/${planPathOrId}`);
+        try {
+            return JSON.parse(resource);
+        } catch {
+            return { content: null };
+        }
+    }
+
+    async getExecutionPlan(planPathOrId: string): Promise<{ type: string; filename: string; content: string | null; updatedAt?: string }> {
+        return this.getArtifact(planPathOrId, 'execution_plan');
+    }
+
+    async getHistory(planPathOrId: string): Promise<any> {
+        const resource = await this.readResource(`riotplan://history/${planPathOrId}`);
+        try {
+            return JSON.parse(resource);
+        } catch {
+            return { events: [] };
+        }
+    }
+
+    onNotification(method: string, handler: (data: unknown) => void): () => void {
+        if (!this.notificationHandlers.has(method)) {
+            this.notificationHandlers.set(method, []);
+        }
+        this.notificationHandlers.get(method)!.push(handler);
+        return () => {
+            const handlers = this.notificationHandlers.get(method);
+            if (!handlers) {
+                return;
+            }
+            const idx = handlers.indexOf(handler);
+            if (idx >= 0) {
+                handlers.splice(idx, 1);
+            }
+        };
+    }
+
+    async subscribeToResource(uri: string): Promise<void> {
+        await this.sendRequest('resources/subscribe', { uri });
+    }
+
+    async unsubscribeFromResource(uri: string): Promise<void> {
+        await this.sendRequest('resources/unsubscribe', { uri });
+    }
+
+    private startSSEConnection(): void {
+        if (!this.sessionId) {
+            return;
+        }
+        this.stopSSEConnection();
+        const url = new URL(`${this.serverUrl}/mcp`);
+        const isHttps = url.protocol === 'https:';
+        const client = isHttps ? https : http;
+        const req = client.request(
+            {
+                hostname: url.hostname,
+                port: url.port || (isHttps ? 443 : 80),
+                path: url.pathname,
+                method: 'GET',
+                headers: {
+                    Accept: 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    'Mcp-Session-Id': this.sessionId,
+                },
+            },
+            (res) => {
+                if (res.statusCode !== 200) {
+                    if (res.statusCode === 404) {
+                        void this.recoverSession();
+                    }
+                    return;
+                }
+                let buffer = '';
+                res.on('data', (chunk: Buffer) => {
+                    buffer += chunk.toString();
+                    while (buffer.includes('\n\n')) {
+                        const eventEnd = buffer.indexOf('\n\n');
+                        const eventText = buffer.substring(0, eventEnd);
+                        buffer = buffer.substring(eventEnd + 2);
+                        this.handleSSEEvent(eventText);
+                    }
+                });
+                res.on('end', () => {
+                    this.sseConnection = null;
+                    setTimeout(() => {
+                        if (this.sessionId) {
+                            this.startSSEConnection();
+                        }
+                    }, 3000);
+                });
+            }
+        );
+        req.on('error', () => {
+            this.sseConnection = null;
+        });
+        req.end();
+        this.sseConnection = req;
+    }
+
+    private stopSSEConnection(): void {
+        if (this.sseConnection) {
+            this.sseConnection.destroy();
+            this.sseConnection = null;
+        }
+    }
+
+    private handleSSEEvent(eventText: string): void {
+        let dataPayload = '';
+        for (const line of eventText.split('\n')) {
+            if (line.startsWith('data:')) {
+                dataPayload += line.substring(5).trim();
+            }
+        }
+        if (!dataPayload) {
+            return;
+        }
+        try {
+            const notification = JSON.parse(dataPayload);
+            const method = notification.method;
+            if (!method) {
+                return;
+            }
+            const handlers = this.notificationHandlers.get(method) || [];
+            for (const handler of handlers) {
+                handler(notification.params || {});
+            }
+        } catch {
+            // Ignore non-JSON ping/comment payloads
+        }
+    }
+
+    dispose(): void {
+        this.stopSSEConnection();
+        this.notificationHandlers.clear();
     }
 }

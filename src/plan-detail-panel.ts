@@ -6,7 +6,6 @@
  */
 
 import * as vscode from 'vscode';
-import * as path from 'path';
 import { HttpMcpClient } from './mcp-client';
 
 export class PlanDetailPanel {
@@ -15,6 +14,11 @@ export class PlanDetailPanel {
 
     private readonly _panel: vscode.WebviewPanel;
     private _disposables: vscode.Disposable[] = [];
+    private readonly resourceUri: string;
+    private unsubscribeNotification?: () => void;
+    private unsubscribeSessionRecovered?: () => void;
+    private refreshTimer?: ReturnType<typeof setTimeout>;
+    private readonly subscribedResourceUris = new Set<string>();
 
     private constructor(
         panel: vscode.WebviewPanel,
@@ -23,12 +27,26 @@ export class PlanDetailPanel {
         private readonly initialProject?: any
     ) {
         this._panel = panel;
+        this.resourceUri = `riotplan://plan/${this.planPath}`;
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
         this._panel.webview.onDidReceiveMessage(
             (msg) => this._handleMessage(msg),
             null,
             this._disposables
         );
+        this.unsubscribeNotification = this.mcpClient.onNotification(
+            'notifications/resource_changed',
+            async (data: unknown) => {
+                const uris = this.extractNotificationUris(data);
+                if (uris.some((uri) => this.resourceMatchesPlan(uri))) {
+                    this.scheduleRefresh();
+                }
+            }
+        );
+        this.unsubscribeSessionRecovered = this.mcpClient.onSessionRecovered(async () => {
+            await this.subscribeToPlanResources();
+        });
+        void this.subscribeToPlanResources();
         this._loadContent();
     }
 
@@ -80,6 +98,15 @@ export class PlanDetailPanel {
             case 'addEvidence':
                 await this._addEvidence(msg.description, msg.source, msg.summary, msg.content);
                 break;
+            case 'copyPlanId':
+                await this._copyPlanIdToClipboard();
+                break;
+            case 'copyEvidenceUrl':
+                await this._copyEvidenceUrlToClipboard(msg.filename, msg.idx);
+                break;
+            case 'copyEvidenceContent':
+                await this._copyEvidenceContentToClipboard(msg.filename, msg.content, msg.idx);
+                break;
         }
     }
 
@@ -87,16 +114,101 @@ export class PlanDetailPanel {
         this._panel.webview.html = this._getLoadingHtml();
 
         try {
-            const [status, context, planResource] = await Promise.all([
+            const [status, context, planResource, summaryArtifact, executionPlanArtifact, steps] = await Promise.all([
                 this.mcpClient.getPlanStatus(this.planPath),
                 this.mcpClient.readContext(this.planPath).catch(() => null),
                 this.mcpClient.getPlanResource(this.planPath).catch(() => null),
+                this.mcpClient.getArtifact(this.planPath, 'summary').catch(() => null),
+                this.mcpClient.getExecutionPlan(this.planPath).catch(() => null),
+                this.mcpClient.listSteps(this.planPath).catch(() => []),
             ]);
 
-            this._panel.webview.html = this._getHtml(status, context, planResource);
+            const enrichedContext = {
+                ...context,
+                summary: summaryArtifact,
+                executionPlan: executionPlanArtifact,
+            };
+
+            const statusWithSteps = {
+                ...(status || {}),
+                steps: Array.isArray(steps) ? steps : [],
+            };
+
+            this._panel.webview.html = this._getHtml(statusWithSteps, enrichedContext, planResource);
         } catch (error) {
             this._panel.webview.html = this._getErrorHtml(String(error));
         }
+    }
+
+    private scheduleRefresh(): void {
+        if (this.refreshTimer) {
+            clearTimeout(this.refreshTimer);
+        }
+        this.refreshTimer = setTimeout(() => {
+            this.refreshTimer = undefined;
+            void this._loadContent();
+        }, 250);
+    }
+
+    private getPlanResourceUris(): string[] {
+        return [
+            `riotplan://plan/${this.planPath}`,
+            `riotplan://status/${this.planPath}`,
+            `riotplan://steps/${this.planPath}`,
+            `riotplan://history/${this.planPath}`,
+            `riotplan://shaping/${this.planPath}`,
+            `riotplan://artifact/${this.planPath}?type=summary`,
+            `riotplan://artifact/${this.planPath}?type=execution_plan`,
+        ];
+    }
+
+    private async subscribeToPlanResources(): Promise<void> {
+        const uris = this.getPlanResourceUris();
+        for (const uri of uris) {
+            try {
+                await this.mcpClient.subscribeToResource(uri);
+                this.subscribedResourceUris.add(uri);
+            } catch {
+                // Continue without hard-failing the panel if a specific subscription is unavailable.
+            }
+        }
+    }
+
+    private extractNotificationUris(data: unknown): string[] {
+        const params = data as {
+            uri?: unknown;
+            resource?: { uri?: unknown };
+            resources?: Array<{ uri?: unknown }>;
+            uris?: unknown[];
+        };
+        const values: unknown[] = [
+            params?.uri,
+            params?.resource?.uri,
+            ...(Array.isArray(params?.resources) ? params.resources.map((resource) => resource?.uri) : []),
+            ...(Array.isArray(params?.uris) ? params.uris : []),
+        ];
+        return values.filter((value): value is string => typeof value === 'string' && value.length > 0);
+    }
+
+    private resourceMatchesPlan(uri: string): boolean {
+        const normalizedPlanPath = this.planPath.toLowerCase();
+        const encodedPlanPath = encodeURIComponent(this.planPath).toLowerCase();
+        const candidates = [uri];
+
+        try {
+            candidates.push(decodeURIComponent(uri));
+        } catch {
+            // Ignore malformed URI encoding and just use original URI.
+        }
+
+        return candidates.some((candidate) => {
+            const normalized = candidate.toLowerCase();
+            return (
+                normalized === this.resourceUri.toLowerCase() ||
+                normalized.includes(normalizedPlanPath) ||
+                normalized.includes(encodedPlanPath)
+            );
+        });
     }
 
     private async _saveIdeaContent(content: string): Promise<void> {
@@ -111,21 +223,7 @@ export class PlanDetailPanel {
 
     private async _sendStepContent(stepNumber: number): Promise<void> {
         try {
-            const planDir = vscode.Uri.file(path.join(this.planPath, 'plan'));
-            const files = await vscode.workspace.fs.readDirectory(planDir);
-            const prefix = String(stepNumber).padStart(2, '0');
-            const stepFile = files.find(([name]) => name.startsWith(prefix + '-'));
-            if (stepFile) {
-                const fileUri = vscode.Uri.file(path.join(this.planPath, 'plan', stepFile[0]));
-                const data = await vscode.workspace.fs.readFile(fileUri);
-                const content = Buffer.from(data).toString('utf8');
-                this._panel.webview.postMessage({ command: 'stepContent', stepNumber, content });
-                return;
-            }
-            // Fallback: try MCP resource
-            const content = await this.mcpClient.readResource(
-                `riotplan://step/${this.planPath}?number=${stepNumber}`
-            );
+            const content = await this.mcpClient.getStepContent(this.planPath, stepNumber);
             this._panel.webview.postMessage({ command: 'stepContent', stepNumber, content });
         } catch (error) {
             this._panel.webview.postMessage({
@@ -138,9 +236,7 @@ export class PlanDetailPanel {
 
     private async _sendEvidenceContent(filename: string): Promise<void> {
         try {
-            const fileUri = vscode.Uri.file(path.join(this.planPath, 'evidence', filename));
-            const data = await vscode.workspace.fs.readFile(fileUri);
-            const content = Buffer.from(data).toString('utf8');
+            const content = await this.mcpClient.getEvidenceContent(this.planPath, filename);
             this._panel.webview.postMessage({ command: 'evidenceContent', filename, content });
         } catch (error) {
             this._panel.webview.postMessage({
@@ -152,14 +248,15 @@ export class PlanDetailPanel {
     }
 
     private async _saveEvidenceContent(filename: string, content: string): Promise<void> {
-        try {
-            const fileUri = vscode.Uri.file(path.join(this.planPath, 'evidence', filename));
-            await vscode.workspace.fs.writeFile(fileUri, Buffer.from(content, 'utf8'));
-            await this._loadContent();
-        } catch (error) {
-            vscode.window.showErrorMessage(`Failed to save evidence: ${error}`);
-            this._panel.webview.postMessage({ command: 'saveError', error: String(error) });
-        }
+        void filename;
+        void content;
+        vscode.window.showWarningMessage(
+            'Editing existing evidence files is not yet supported in service-only mode. Add a new evidence item instead.'
+        );
+        this._panel.webview.postMessage({
+            command: 'saveError',
+            error: 'Editing existing evidence is not supported in service-only mode yet.',
+        });
     }
 
     private async _addEvidence(
@@ -177,7 +274,62 @@ export class PlanDetailPanel {
         }
     }
 
+    private async _copyPlanIdToClipboard(): Promise<void> {
+        try {
+            await vscode.env.clipboard.writeText(this.planPath);
+            vscode.window.setStatusBarMessage('Copied plan ID to clipboard', 2000);
+            this._panel.webview.postMessage({ command: 'copyPlanIdResult', ok: true });
+        } catch (error) {
+            this._panel.webview.postMessage({ command: 'copyPlanIdResult', ok: false });
+            vscode.window.showErrorMessage(`Failed to copy plan ID: ${error}`);
+        }
+    }
+
+    private async _copyEvidenceUrlToClipboard(filename: string, idx?: number): Promise<void> {
+        try {
+            if (!filename || typeof filename !== 'string') {
+                throw new Error('Missing evidence filename');
+            }
+            const evidenceUrl = `riotplan://evidence-file/${this.planPath}?file=${encodeURIComponent(filename)}`;
+            await vscode.env.clipboard.writeText(evidenceUrl);
+            vscode.window.setStatusBarMessage('Copied evidence URL to clipboard', 2000);
+            this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: true, kind: 'url', idx });
+        } catch (error) {
+            this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: false, kind: 'url', idx });
+            vscode.window.showErrorMessage(`Failed to copy evidence URL: ${error}`);
+        }
+    }
+
+    private async _copyEvidenceContentToClipboard(filename: string, content?: string, idx?: number): Promise<void> {
+        try {
+            if (!filename || typeof filename !== 'string') {
+                throw new Error('Missing evidence filename');
+            }
+            const text = typeof content === 'string' && content.length > 0
+                ? content
+                : await this.mcpClient.getEvidenceContent(this.planPath, filename);
+            await vscode.env.clipboard.writeText(text || '');
+            vscode.window.setStatusBarMessage('Copied evidence content to clipboard', 2000);
+            this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: true, kind: 'content', idx });
+        } catch (error) {
+            this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: false, kind: 'content', idx });
+            vscode.window.showErrorMessage(`Failed to copy evidence content: ${error}`);
+        }
+    }
+
     private dispose(): void {
+        if (this.refreshTimer) {
+            clearTimeout(this.refreshTimer);
+            this.refreshTimer = undefined;
+        }
+        this.unsubscribeNotification?.();
+        this.unsubscribeNotification = undefined;
+        this.unsubscribeSessionRecovered?.();
+        this.unsubscribeSessionRecovered = undefined;
+        for (const uri of this.subscribedResourceUris) {
+            void this.mcpClient.unsubscribeFromResource(uri).catch(() => undefined);
+        }
+        this.subscribedResourceUris.clear();
         PlanDetailPanel.currentPanels.delete(this.planPath);
         this._panel.dispose();
         while (this._disposables.length) {
@@ -254,10 +406,12 @@ export class PlanDetailPanel {
         const ideaContent = context?.idea?.content || '';
         const shapingContent = context?.shaping?.content || '';
         const selectedApproach = context?.shaping?.selectedApproach || '';
+        const summaryContent = context?.summary?.content || '';
+        const executionPlanContent = context?.executionPlan?.content || '';
         const constraints = (context?.constraints || []) as string[];
         const questions = (context?.questions || []) as string[];
         const evidenceFiles = (context?.evidence?.files || []) as Array<{
-            name: string; preview: string; size: number;
+            name: string; title?: string; preview: string; size: number; createdAt?: string;
         }>;
         const historyEvents = (context?.history?.recentEvents || []) as Array<{
             type: string; timestamp: string; summary: string;
@@ -312,28 +466,25 @@ export class PlanDetailPanel {
 </div>`;
             }).join('');
 
-        // Evidence HTML — cards with edit buttons
+        // Evidence HTML — step-like list + detail pane
         const evidenceHtml = evidenceFiles.length === 0
             ? `<div class="empty-state"><span class="empty-icon">◫</span><p>No evidence files attached</p></div>`
-            : evidenceFiles.map((e, idx) => `<div class="evidence-card" id="evidence-card-${idx}">
-  <div class="evidence-header">
-    <span class="evidence-icon">◫</span>
-    <span class="evidence-name">${this._esc(e.name)}</span>
-    ${e.size ? `<span class="evidence-size">${(e.size / 1024).toFixed(1)}kb</span>` : ''}
-    <button class="action-btn small" onclick="startEditEvidence('${this._esc(e.name)}', ${idx})">✎ Edit</button>
-  </div>
-  <div id="evidence-view-${idx}">
-    ${e.preview ? `<pre class="evidence-preview">${this._esc(e.preview)}</pre>` : ''}
-  </div>
-  <div class="evidence-edit-area" id="evidence-edit-${idx}" style="display:none">
-    <div class="edit-loading" id="evidence-loading-${idx}">Loading content…</div>
-    <textarea class="content-editor" id="evidence-textarea-${idx}" style="display:none;min-height:200px"></textarea>
-    <div class="editor-actions" id="evidence-edit-actions-${idx}" style="display:none">
-      <button class="action-btn primary" onclick="saveEvidence('${this._esc(e.name)}', ${idx})">Save</button>
-      <button class="action-btn" onclick="cancelEditEvidence(${idx})">Cancel</button>
-    </div>
-  </div>
-</div>`).join('');
+            : evidenceFiles.map((e, idx) => {
+                const addedDate = e.createdAt ? new Date(e.createdAt) : null;
+                const addedLabel = addedDate && !Number.isNaN(addedDate.getTime())
+                    ? `Added ${addedDate.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
+                    : 'Added date unknown';
+                return `<div class="evidence-row" role="button" tabindex="0" data-evidence-idx="${idx}" onclick="selectEvidence(${idx})">
+  <span class="evidence-row-icon">◫</span>
+  <span class="evidence-row-body">
+    <span class="evidence-row-name">${this._esc(e.title || e.name)}</span>
+    <span class="evidence-row-id">ID: ${this._esc(e.name)}</span>
+    <span class="evidence-row-meta">${this._esc(addedLabel)}</span>
+  </span>
+  ${e.size ? `<span class="evidence-row-size">${(e.size / 1024).toFixed(1)} kb</span>` : ''}
+  <button class="evidence-row-action" id="evidence-copy-url-${idx}" onclick="copyEvidenceUrl(${idx}, event)" title="Copy Evidence URL">⧉</button>
+</div>`;
+            }).join('');
 
         // History HTML
         const historyHtml = historyEvents.length === 0
@@ -379,6 +530,9 @@ export class PlanDetailPanel {
         const escapeScript = (s: string) => s.replace(/<\//g, '\\u003c/');
         const ideaJson = escapeScript(JSON.stringify(ideaContent));
         const shapingJson = escapeScript(JSON.stringify(shapingContent));
+        const summaryJson = escapeScript(JSON.stringify(summaryContent));
+        const executionPlanJson = escapeScript(JSON.stringify(executionPlanContent));
+        const evidenceFilesJson = escapeScript(JSON.stringify(evidenceFiles));
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -507,6 +661,23 @@ body {
 }
 .meta-item .mono {
     font-family: var(--vscode-editor-font-family, monospace);
+}
+.copy-inline-btn {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--vscode-descriptionForeground);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+    line-height: 1.2;
+    cursor: pointer;
+    margin-left: 3px;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.copy-inline-btn:hover {
+    background: var(--vscode-toolbar-hoverBackground);
+    color: var(--vscode-editor-foreground);
+    border-color: var(--vscode-button-secondaryBorder, rgba(255,255,255,0.2));
 }
 .meta-link {
     color: var(--vscode-textLink-foreground, #4fc3f7);
@@ -712,6 +883,22 @@ body {
 }
 .md-content a { color: var(--vscode-textLink-foreground, #4fc3f7); text-decoration: none; }
 .md-content a:hover { text-decoration: underline; }
+.md-content table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0 0 12px;
+    font-size: 12px;
+}
+.md-content th, .md-content td {
+    border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.14));
+    padding: 6px 8px;
+    text-align: left;
+    vertical-align: top;
+}
+.md-content th {
+    background: var(--vscode-sideBar-background, rgba(255,255,255,0.05));
+    font-weight: 600;
+}
 
 /* ── Meta sections (constraints, questions) ─────────────────── */
 .meta-section {
@@ -856,63 +1043,186 @@ body {
 }
 
 /* ── Evidence ─────────────────────────────────────────────────── */
+.evidence-layout {
+    display: grid;
+    grid-template-columns: minmax(260px, 34%) 1fr;
+    gap: 14px;
+    min-height: 360px;
+}
 .evidence-list {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 4px;
+    border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1));
+    border-radius: 6px;
+    padding: 8px;
+    background: var(--vscode-sideBar-background, rgba(255,255,255,0.02));
+    max-height: calc(100vh - 330px);
+    overflow: auto;
 }
-.evidence-card {
-    padding: 12px 14px;
+.evidence-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    width: 100%;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+    padding: 8px 9px;
+    font-family: inherit;
+    font-size: inherit;
+}
+.evidence-row:hover {
+    background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.04));
+    border-color: var(--vscode-panel-border, rgba(255,255,255,0.08));
+}
+.evidence-row.active {
+    background: rgba(79, 195, 247, 0.08);
+    border-color: rgba(79, 195, 247, 0.24);
+}
+.evidence-row-icon {
+    color: var(--vscode-descriptionForeground);
+    font-size: 12px;
+    margin-top: 1px;
+    flex-shrink: 0;
+}
+.evidence-row-body {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.evidence-row-name {
+    font-size: 12px;
+    color: var(--vscode-editor-foreground);
+    font-weight: 500;
+    word-break: break-word;
+}
+.evidence-row-preview {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.75;
+    line-height: 1.35;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.evidence-row-size {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+    margin-top: 2px;
+    flex-shrink: 0;
+}
+.evidence-row-meta {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+    line-height: 1.3;
+}
+.evidence-row-id {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.75;
+    font-family: var(--vscode-editor-font-family, monospace);
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.evidence-row-action {
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--vscode-descriptionForeground);
+    font-size: 11px;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 2px 6px;
+    margin-top: 1px;
+    flex-shrink: 0;
+}
+.evidence-row-action:hover {
+    background: var(--vscode-toolbar-hoverBackground, rgba(255,255,255,0.08));
+    color: var(--vscode-editor-foreground);
+    border-color: var(--vscode-panel-border, rgba(255,255,255,0.15));
+}
+.evidence-row-action.copied {
+    color: #81c784;
+    border-color: rgba(129, 199, 132, 0.3);
+}
+.evidence-detail {
     border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.1));
     border-radius: 6px;
     background: var(--vscode-sideBar-background, rgba(255,255,255,0.02));
+    padding: 14px;
+    overflow: auto;
+    max-height: calc(100vh - 330px);
 }
-.evidence-header {
+.evidence-detail-header {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
-    margin-bottom: 6px;
+    margin-bottom: 10px;
 }
-.evidence-icon {
-    color: var(--vscode-descriptionForeground);
-    font-size: 13px;
-    flex-shrink: 0;
-}
-.evidence-name {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--vscode-editor-foreground);
-    flex: 1;
-}
-.evidence-size {
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground);
-    opacity: 0.6;
-}
-.evidence-preview {
+.evidence-detail-title {
     margin: 0;
-    font-family: var(--vscode-editor-font-family, monospace);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--vscode-editor-foreground);
+    line-height: 1.35;
+}
+.evidence-detail-meta {
     font-size: 11px;
     color: var(--vscode-descriptionForeground);
-    background: var(--vscode-textCodeBlock-background, rgba(255,255,255,0.05));
-    padding: 8px 10px;
+    opacity: 0.75;
+}
+.evidence-detail-loading {
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.8;
+}
+.evidence-context-menu {
+    position: fixed;
+    z-index: 9999;
+    min-width: 210px;
+    background: var(--vscode-menu-background, var(--vscode-editor-background));
+    border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border, rgba(255,255,255,0.2)));
+    border-radius: 6px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.28);
+    padding: 6px;
+}
+.evidence-context-item {
+    width: 100%;
+    text-align: left;
+    border: none;
+    background: transparent;
+    color: var(--vscode-menu-foreground, var(--vscode-editor-foreground));
+    font-family: inherit;
+    font-size: 12px;
+    padding: 7px 8px;
     border-radius: 4px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    line-height: 1.5;
-    border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.06));
+    cursor: pointer;
 }
-.evidence-edit-area {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.08));
+.evidence-context-item:hover {
+    background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.08));
 }
-.edit-loading {
-    font-size: 11px;
-    color: var(--vscode-descriptionForeground);
-    opacity: 0.6;
-    padding: 4px 0;
+@media (max-width: 1100px) {
+    .evidence-layout {
+        grid-template-columns: 1fr;
+        gap: 10px;
+    }
+    .evidence-list {
+        max-height: 220px;
+    }
+    .evidence-detail {
+        max-height: none;
+        min-height: 240px;
+    }
 }
 
 /* ── Evidence add form ───────────────────────────────────────── */
@@ -1010,6 +1320,75 @@ body {
     margin-top: 3px;
 }
 
+/* ── Overview grid ───────────────────────────────────────────── */
+.overview-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+.overview-section {
+    padding: 16px;
+    background: var(--vscode-sideBar-background, rgba(255,255,255,0.03));
+    border: 1px solid var(--vscode-panel-border, rgba(255,255,255,0.08));
+    border-radius: 6px;
+}
+.overview-section-title {
+    margin: 0 0 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--vscode-descriptionForeground);
+}
+.quick-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+}
+.stat-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+}
+.stat-value {
+    font-size: 13px;
+    color: var(--vscode-editor-foreground);
+}
+.empty-hint {
+    font-size: 11px;
+    opacity: 0.6;
+    margin-top: 4px;
+}
+
+/* ── Shaping tab ─────────────────────────────────────────────── */
+.shaping-container {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+.selected-approach-banner {
+    padding: 12px 16px;
+    background: rgba(79, 195, 247, 0.08);
+    border: 1px solid rgba(79, 195, 247, 0.2);
+    border-radius: 6px;
+    font-size: 13px;
+    color: var(--vscode-editor-foreground);
+}
+.approach-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--vscode-descriptionForeground);
+    margin-right: 6px;
+}
+
 /* ── Empty states ────────────────────────────────────────────── */
 .empty-state {
     display: flex;
@@ -1049,7 +1428,7 @@ body {
   </div>` : ''}
 
   <div class="meta-row">
-    ${code ? `<span class="meta-item"><span class="label">code:</span> ${code}</span>` : ''}
+    ${code ? `<span class="meta-item"><span class="label">code:</span> ${code}<button id="copy-plan-id-btn" class="copy-inline-btn" title="Copy plan ID">⧉</button></span>` : ''}
     ${lastUpdated ? `<span class="meta-item"><span class="label">updated:</span> ${this._esc(lastUpdated)}</span>` : ''}
     ${status?.lastCompleted ? `<span class="meta-item"><span class="label">last step:</span> ${status.lastCompleted}</span>` : ''}
     ${projectName ? `<span class="meta-item"><span class="label">project:</span> ${projectName}</span>` : ''}
@@ -1061,13 +1440,38 @@ body {
 <!-- ── Tabs ──────────────────────────────────────────── -->
 <div class="tabs">
   <button class="tab-btn active" data-tab="overview">Overview</button>
-  <button class="tab-btn" data-tab="steps">${this._esc(stepTab)}</button>
+  <button class="tab-btn" data-tab="idea">Idea</button>
   <button class="tab-btn" data-tab="evidence">${this._esc(evidTab)}</button>
+  <button class="tab-btn" data-tab="shaping">Shaping</button>
+  <button class="tab-btn" data-tab="steps">${this._esc(stepTab)}</button>
+  <button class="tab-btn" data-tab="execution">Execution Plan</button>
   <button class="tab-btn" data-tab="history">${this._esc(histTab)}</button>
 </div>
 
 <!-- ── Overview tab ─────────────────────────────────── -->
 <div id="pane-overview" class="pane active">
+  <div class="overview-grid">
+    <div class="overview-section">
+      <h3 class="overview-section-title">Summary</h3>
+      <div class="md-content" id="summary-md">${summaryContent ? '' : '<p class="empty-hint">No summary available</p>'}</div>
+    </div>
+    ${constraintsBlock}
+    ${questionsBlock}
+    ${shapingBlock}
+    <div class="overview-section">
+      <h3 class="overview-section-title">Quick Stats</h3>
+      <div class="quick-stats">
+        <div class="stat-item"><span class="stat-label">Stage</span><span class="stat-value">${this._esc(stage)}</span></div>
+        <div class="stat-item"><span class="stat-label">Progress</span><span class="stat-value">${progress.completed}/${progress.total} steps (${Math.round(pct)}%)</span></div>
+        ${steps.length > 0 ? `<div class="stat-item"><span class="stat-label">Current Step</span><span class="stat-value">${status?.currentStep || 'N/A'}</span></div>` : ''}
+        ${selectedApproach ? `<div class="stat-item"><span class="stat-label">Approach</span><span class="stat-value">${this._esc(selectedApproach)}</span></div>` : ''}
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Idea tab ────────────────────────────────────── -->
+<div id="pane-idea" class="pane">
   <div class="section-toolbar">
     <button class="action-btn" id="edit-idea-btn">✎ Edit Idea</button>
   </div>
@@ -1077,7 +1481,6 @@ body {
         ? `<div class="md-content" id="idea-md"></div>`
         : `<div class="empty-state"><span class="empty-icon">☆</span><p>No IDEA.md found — click Edit to create one</p></div>`
 }
-    ${constraintsBlock}${questionsBlock}${shapingBlock}
   </div>
   <!-- Edit mode -->
   <div id="idea-edit-mode" style="display:none">
@@ -1087,11 +1490,6 @@ body {
       <button class="action-btn" id="cancel-idea-btn">Cancel</button>
     </div>
   </div>
-</div>
-
-<!-- ── Steps tab ────────────────────────────────────── -->
-<div id="pane-steps" class="pane">
-  <div class="steps-list">${stepsHtml}</div>
 </div>
 
 <!-- ── Evidence tab ─────────────────────────────────── -->
@@ -1122,8 +1520,53 @@ body {
       <button class="action-btn" onclick="toggleNewEvidenceForm()">Cancel</button>
     </div>
   </div>
-  <!-- Evidence cards -->
-  <div class="evidence-list">${evidenceHtml}</div>
+  <!-- Evidence list + detail -->
+  ${evidenceFiles.length === 0 ? evidenceHtml : `
+  <div class="evidence-layout">
+    <div class="evidence-list">${evidenceHtml}</div>
+    <div class="evidence-detail">
+      <div id="evidence-detail-empty" class="empty-state" style="padding:28px 16px">
+        <span class="empty-icon">◫</span>
+        <p>Select an evidence entry to view details</p>
+      </div>
+      <div id="evidence-detail-content" style="display:none">
+        <div class="evidence-detail-header">
+          <h3 class="evidence-detail-title" id="evidence-detail-title"></h3>
+          <span class="evidence-detail-meta" id="evidence-detail-size"></span>
+        </div>
+        <div class="evidence-detail-loading" id="evidence-detail-loading" style="display:none">Loading evidence…</div>
+        <div class="md-content" id="evidence-detail-md"></div>
+      </div>
+    </div>
+  </div>`}
+  <div id="evidence-context-menu" class="evidence-context-menu" style="display:none">
+    <button class="evidence-context-item" id="evidence-context-copy-url">Copy Evidence URL</button>
+    <button class="evidence-context-item" id="evidence-context-copy-content">Copy Evidence Content</button>
+  </div>
+</div>
+
+<!-- ── Shaping tab ─────────────────────────────────── -->
+<div id="pane-shaping" class="pane">
+  ${shapingContent
+        ? `<div class="shaping-container">
+          ${selectedApproach ? `<div class="selected-approach-banner"><span class="approach-label">Selected Approach:</span> <strong>${this._esc(selectedApproach)}</strong></div>` : ''}
+          <div class="md-content" id="shaping-full-md"></div>
+        </div>`
+        : `<div class="empty-state"><span class="empty-icon">◇</span><p>No shaping document found</p><p class="empty-hint">Use riotplan_shaping(action: "start") to begin comparing approaches</p></div>`
+}
+</div>
+
+<!-- ── Steps tab ────────────────────────────────────── -->
+<div id="pane-steps" class="pane">
+  <div class="steps-list">${stepsHtml}</div>
+</div>
+
+<!-- ── Execution Plan tab ──────────────────────────── -->
+<div id="pane-execution" class="pane">
+  ${executionPlanContent
+        ? `<div class="md-content" id="execution-plan-md"></div>`
+        : `<div class="empty-state"><span class="empty-icon">▤</span><p>No execution plan found</p><p class="empty-hint">Use riotplan_build to generate an execution plan</p></div>`
+}
 </div>
 
 <!-- ── History tab ──────────────────────────────────── -->
@@ -1132,21 +1575,49 @@ body {
 </div>
 
 <script>
-// ── Tab switching ────────────────────────────────────────────
+// ── VSCode API + tab state + refresh ────────────────────────
+var vscode = acquireVsCodeApi();
+var webviewState = vscode.getState() || {};
+
+function getActiveTab() {
+    var activeBtn = document.querySelector('.tab-btn.active');
+    if (!activeBtn) { return 'overview'; }
+    var tab = activeBtn.getAttribute('data-tab');
+    return tab || 'overview';
+}
+
+function activateTab(tab, persist) {
+    var targetTab = tab || 'overview';
+    document.querySelectorAll('.tab-btn').forEach(function(btn) {
+        var isActive = btn.getAttribute('data-tab') === targetTab;
+        btn.classList.toggle('active', isActive);
+    });
+    document.querySelectorAll('.pane').forEach(function(p) {
+        p.classList.toggle('active', p.id === 'pane-' + targetTab);
+    });
+    if (persist) {
+        webviewState.activeTab = targetTab;
+        vscode.setState(webviewState);
+    }
+}
+
 document.querySelectorAll('.tab-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-        var tab = btn.dataset.tab;
-        document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
-        document.querySelectorAll('.pane').forEach(function(p) { p.classList.remove('active'); });
-        btn.classList.add('active');
-        var pane = document.getElementById('pane-' + tab);
-        if (pane) { pane.classList.add('active'); }
+        activateTab(btn.dataset.tab || 'overview', true);
     });
 });
 
-// ── VSCode API + Refresh ─────────────────────────────────────
-var vscode = acquireVsCodeApi();
-function refresh() { vscode.postMessage({ command: 'refresh' }); }
+var initialTab = typeof webviewState.activeTab === 'string' ? webviewState.activeTab : 'overview';
+activateTab(initialTab, false);
+if (!webviewState.activeTab) {
+    webviewState.activeTab = initialTab;
+    vscode.setState(webviewState);
+}
+
+function refresh() {
+    vscode.postMessage({ command: 'refresh', activeTab: getActiveTab() });
+}
+function copyPlanId() { vscode.postMessage({ command: 'copyPlanId' }); }
 
 // ── Minimal markdown renderer ────────────────────────────────
 function renderMarkdown(md) {
@@ -1180,13 +1651,20 @@ function renderMarkdown(md) {
     html = html.replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>');
     html = html.replace(/__(.+?)__/g, '<strong>$1</strong>');
     html = html.replace(/\\*(.+?)\\*/g, '<em>$1</em>');
-    html = html.replace(/_([^_]+)_/g, '<em>$1</em>');
+    // Only treat underscores as emphasis delimiters at word boundaries.
+    // This preserves identifiers like riotplan_step.
+    html = html.replace(/(^|[^\\w])_([^_\\n]+)_(?=[^\\w]|$)/g, function(_, prefix, text) {
+        return prefix + '<em>' + text + '</em>';
+    });
 
     // Inline code
     html = html.replace(/\x60([^\x60]+)\x60/g, '<code>$1</code>');
 
     // Links
     html = html.replace(/\\[([^\\]]+)\\]\\(([^)]+)\\)/g, '<a href="$2">$1</a>');
+
+    // Pipe tables
+    html = renderPipeTables(html);
 
     // Unordered lists
     html = html.replace(/((?:^[-*] .+$\\n?)+)/gm, function(match) {
@@ -1207,7 +1685,7 @@ function renderMarkdown(md) {
     });
 
     // Paragraphs
-    var blockTags = /^<(h[1-6]|ul|ol|pre|hr|blockquote)/;
+    var blockTags = /^<(h[1-6]|ul|ol|pre|hr|blockquote|table)/;
     html = html.split(/\\n\\n+/).map(function(block) {
         var trimmed = block.trim();
         if (!trimmed) { return ''; }
@@ -1218,6 +1696,63 @@ function renderMarkdown(md) {
     return html;
 }
 
+function renderPipeTables(md) {
+    var lines = md.split('\\n');
+    var out = [];
+    var i = 0;
+    while (i < lines.length) {
+        var header = lines[i];
+        var divider = lines[i + 1];
+        if (isTableRow(header) && isTableDivider(divider)) {
+            var headers = splitTableRow(header);
+            var bodyRows = [];
+            i += 2;
+            while (i < lines.length && isTableRow(lines[i])) {
+                bodyRows.push(splitTableRow(lines[i]));
+                i += 1;
+            }
+            if (headers.length > 1) {
+                var thead = '<thead><tr>' + headers.map(function(cell) { return '<th>' + cell + '</th>'; }).join('') + '</tr></thead>';
+                var tbody = bodyRows.length
+                    ? '<tbody>' + bodyRows.map(function(row) {
+                        var cells = row.slice(0, headers.length);
+                        while (cells.length < headers.length) { cells.push(''); }
+                        return '<tr>' + cells.map(function(cell) { return '<td>' + cell + '</td>'; }).join('') + '</tr>';
+                    }).join('') + '</tbody>'
+                    : '';
+                out.push('<table>' + thead + tbody + '</table>');
+                continue;
+            }
+            out.push(header);
+            if (divider != null) { out.push(divider); }
+            continue;
+        }
+        out.push(lines[i]);
+        i += 1;
+    }
+    return out.join('\\n');
+}
+
+function splitTableRow(line) {
+    var parts = line.split('|').map(function(part) { return part.trim(); });
+    if (parts.length && parts[0] === '') { parts.shift(); }
+    if (parts.length && parts[parts.length - 1] === '') { parts.pop(); }
+    return parts;
+}
+
+function isTableRow(line) {
+    if (typeof line !== 'string') { return false; }
+    var cells = splitTableRow(line);
+    return line.indexOf('|') !== -1 && cells.length > 1;
+}
+
+function isTableDivider(line) {
+    if (typeof line !== 'string') { return false; }
+    var cells = splitTableRow(line);
+    if (cells.length < 2) { return false; }
+    return cells.every(function(cell) { return /^:?-{3,}:?$/.test(cell); });
+}
+
 function escHtml(s) {
     if (s == null || typeof s !== 'string') { return ''; }
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -1226,11 +1761,18 @@ function escHtml(s) {
 // ── Render initial markdown content ─────────────────────────
 var ideaMd = ${ideaJson};
 var shapingMd = ${shapingJson};
+var summaryMd = ${summaryJson};
+var executionPlanMd = ${executionPlanJson};
+var evidenceEntries = ${evidenceFilesJson};
 try {
     var ideaEl = document.getElementById('idea-md');
     if (ideaEl && ideaMd) { ideaEl.innerHTML = renderMarkdown(ideaMd); }
-    var shapingEl = document.getElementById('shaping-md');
+    var shapingEl = document.getElementById('shaping-full-md');
     if (shapingEl && shapingMd) { shapingEl.innerHTML = renderMarkdown(shapingMd); }
+    var summaryEl = document.getElementById('summary-md');
+    if (summaryEl && summaryMd) { summaryEl.innerHTML = renderMarkdown(summaryMd); }
+    var executionPlanEl = document.getElementById('execution-plan-md');
+    if (executionPlanEl && executionPlanMd) { executionPlanEl.innerHTML = renderMarkdown(executionPlanMd); }
 } catch (e) {
     console.error('Markdown render error:', e);
 }
@@ -1260,6 +1802,8 @@ var saveIdeaBtn = document.getElementById('save-idea-btn');
 if (saveIdeaBtn) { saveIdeaBtn.addEventListener('click', saveIdea); }
 var cancelIdeaBtn = document.getElementById('cancel-idea-btn');
 if (cancelIdeaBtn) { cancelIdeaBtn.addEventListener('click', cancelEditIdea); }
+var copyPlanIdBtn = document.getElementById('copy-plan-id-btn');
+if (copyPlanIdBtn) { copyPlanIdBtn.addEventListener('click', copyPlanId); }
 
 // ── Step expansion ───────────────────────────────────────────
 var stepLoaded = {};
@@ -1325,37 +1869,242 @@ function submitNewEvidence() {
     toggleNewEvidenceForm();
 }
 
-// ── Evidence editing ─────────────────────────────────────────
-// Track which card index is awaiting content per filename
+// ── Evidence list/detail ─────────────────────────────────────
 var evidencePendingIdx = {};
+var evidenceLoaded = {};
+var evidenceContentByIdx = {};
+var evidenceRawContentByIdx = {};
+var selectedEvidenceIdx = -1;
+var evidenceContextIdx = -1;
 
-function startEditEvidence(filename, idx) {
-    var editArea = document.getElementById('evidence-edit-' + idx);
-    var viewArea = document.getElementById('evidence-view-' + idx);
-    if (!editArea) { return; }
-    if (viewArea) { viewArea.style.display = 'none'; }
-    editArea.style.display = 'block';
-    var loading = document.getElementById('evidence-loading-' + idx);
-    var textarea = document.getElementById('evidence-textarea-' + idx);
-    var actions = document.getElementById('evidence-edit-actions-' + idx);
+function selectEvidence(idx) {
+    if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    var entry = evidenceEntries[idx];
+    selectedEvidenceIdx = idx;
+
+    document.querySelectorAll('.evidence-row').forEach(function(row) {
+        row.classList.remove('active');
+    });
+    var activeRow = document.querySelector('.evidence-row[data-evidence-idx="' + idx + '"]');
+    if (activeRow) { activeRow.classList.add('active'); }
+
+    var empty = document.getElementById('evidence-detail-empty');
+    var content = document.getElementById('evidence-detail-content');
+    var loading = document.getElementById('evidence-detail-loading');
+    var body = document.getElementById('evidence-detail-md');
+    var title = document.getElementById('evidence-detail-title');
+    var sizeEl = document.getElementById('evidence-detail-size');
+
+    if (empty) { empty.style.display = 'none'; }
+    if (content) { content.style.display = 'block'; }
+    if (title) { title.textContent = getEvidenceTitle(entry); }
+    if (sizeEl) { sizeEl.textContent = formatEvidenceMeta(entry); }
+
+    if (evidenceLoaded[idx]) {
+        if (loading) { loading.style.display = 'none'; }
+        if (body) { body.innerHTML = renderMarkdown(evidenceContentByIdx[idx] || ''); }
+        return;
+    }
+
     if (loading) { loading.style.display = 'block'; }
-    if (textarea) { textarea.style.display = 'none'; }
-    if (actions) { actions.style.display = 'none'; }
+    if (body) { body.innerHTML = ''; }
+    var filename = entry.name;
     evidencePendingIdx[filename] = idx;
     vscode.postMessage({ command: 'getEvidenceContent', filename: filename });
 }
 
-function saveEvidence(filename, idx) {
-    var textarea = document.getElementById('evidence-textarea-' + idx);
-    if (!textarea) { return; }
-    vscode.postMessage({ command: 'saveEvidenceContent', filename: filename, content: textarea.value });
+function copyEvidenceUrl(idx, ev) {
+    if (ev) { ev.stopPropagation(); }
+    if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    vscode.postMessage({
+        command: 'copyEvidenceUrl',
+        filename: evidenceEntries[idx].name,
+        idx: idx,
+    });
 }
 
-function cancelEditEvidence(idx) {
-    var editArea = document.getElementById('evidence-edit-' + idx);
-    var viewArea = document.getElementById('evidence-view-' + idx);
-    if (editArea) { editArea.style.display = 'none'; }
-    if (viewArea) { viewArea.style.display = 'block'; }
+function copyEvidenceContent(idx, ev) {
+    if (ev) { ev.stopPropagation(); }
+    if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    vscode.postMessage({
+        command: 'copyEvidenceContent',
+        filename: evidenceEntries[idx].name,
+        content: evidenceRawContentByIdx[idx] || '',
+        idx: idx,
+    });
+}
+
+function normalizeEvidenceContent(raw) {
+    if (typeof raw !== 'string') { return ''; }
+    var trimmed = raw.trim();
+    if (!trimmed) { return ''; }
+
+    if (trimmed[0] !== '{' && trimmed[0] !== '[') {
+        return raw;
+    }
+
+    try {
+        var parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+            return '**JSON**\\n\\n' + JSON.stringify(parsed, null, 2);
+        }
+        if (!parsed || typeof parsed !== 'object') {
+            return raw;
+        }
+
+        var markdownBody = '';
+        var candidates = ['content', 'markdown', 'md', 'body', 'text'];
+        for (var i = 0; i < candidates.length; i += 1) {
+            var key = candidates[i];
+            if (typeof parsed[key] === 'string' && parsed[key].trim()) {
+                markdownBody = parsed[key];
+                break;
+            }
+        }
+        if (!markdownBody) {
+            markdownBody = '**JSON**\\n\\n' + JSON.stringify(parsed, null, 2);
+        }
+
+        var extras = [];
+        if (typeof parsed.description === 'string' && parsed.description.trim()) {
+            extras.push('**Description:** ' + parsed.description.trim());
+        }
+        if (typeof parsed.source === 'string' && parsed.source.trim()) {
+            extras.push('**Source:** ' + parsed.source.trim());
+        }
+        if (typeof parsed.summary === 'string' && parsed.summary.trim()) {
+            extras.push('**Summary:** ' + parsed.summary.trim());
+        }
+
+        if (extras.length > 0) {
+            return extras.join('\\n\\n') + '\\n\\n---\\n\\n' + markdownBody;
+        }
+        return markdownBody;
+    } catch {
+        return raw;
+    }
+}
+
+function titleFromFilename(name) {
+    if (typeof name !== 'string' || !name) { return 'Evidence'; }
+    var lastPart = name.split('/').pop() || name;
+    var withoutExt = lastPart.replace(/[.][^.]+$/, '');
+    var normalized = withoutExt
+        .replace(/^[0-9]{4}-[0-9]{2}-[0-9]{2}-/, '')
+        .replace(/[-_]+/g, ' ')
+        .trim();
+    if (!normalized) { return name; }
+    return normalized
+        .split(' ')
+        .filter(Boolean)
+        .map(function(token) { return token.charAt(0).toUpperCase() + token.slice(1); })
+        .join(' ');
+}
+
+function getEvidenceTitle(entry) {
+    if (entry && typeof entry.title === 'string' && entry.title.trim()) {
+        return entry.title.trim();
+    }
+    if (entry && typeof entry.name === 'string' && entry.name.trim()) {
+        return titleFromFilename(entry.name.trim());
+    }
+    return 'Evidence';
+}
+
+function formatEvidenceMeta(entry) {
+    var sizeText = '';
+    if (entry && typeof entry.size === 'number' && entry.size > 0) {
+        sizeText = (entry.size / 1024).toFixed(1) + ' kb';
+    }
+
+    var dateText = '';
+    if (entry && typeof entry.createdAt === 'string' && entry.createdAt.trim()) {
+        var d = new Date(entry.createdAt);
+        if (!Number.isNaN(d.getTime())) {
+            dateText = 'Added ' + d.toLocaleDateString(undefined, {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+            });
+        }
+    }
+
+    if (dateText && sizeText) {
+        return dateText + ' · ' + sizeText;
+    }
+    return dateText || sizeText || 'Added date unknown';
+}
+
+function hideEvidenceContextMenu() {
+    var menu = document.getElementById('evidence-context-menu');
+    if (menu) { menu.style.display = 'none'; }
+    evidenceContextIdx = -1;
+}
+
+function showEvidenceContextMenu(x, y, idx) {
+    var menu = document.getElementById('evidence-context-menu');
+    if (!menu) { return; }
+    evidenceContextIdx = idx;
+    menu.style.display = 'block';
+    menu.style.left = x + 'px';
+    menu.style.top = y + 'px';
+}
+
+function wireEvidenceRowContextMenu() {
+    var copyUrlBtn = document.getElementById('evidence-context-copy-url');
+    if (copyUrlBtn) {
+        copyUrlBtn.addEventListener('click', function() {
+            if (evidenceContextIdx >= 0) { copyEvidenceUrl(evidenceContextIdx); }
+            hideEvidenceContextMenu();
+        });
+    }
+
+    var copyContentBtn = document.getElementById('evidence-context-copy-content');
+    if (copyContentBtn) {
+        copyContentBtn.addEventListener('click', function() {
+            if (evidenceContextIdx >= 0) { copyEvidenceContent(evidenceContextIdx); }
+            hideEvidenceContextMenu();
+        });
+    }
+
+    document.querySelectorAll('.evidence-row').forEach(function(row) {
+        row.addEventListener('contextmenu', function(event) {
+            event.preventDefault();
+            var idxStr = row.getAttribute('data-evidence-idx');
+            var idx = idxStr ? parseInt(idxStr, 10) : -1;
+            if (idx >= 0) {
+                selectEvidence(idx);
+                showEvidenceContextMenu(event.clientX, event.clientY, idx);
+            }
+        });
+        row.addEventListener('keydown', function(event) {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                var idxStr = row.getAttribute('data-evidence-idx');
+                var idx = idxStr ? parseInt(idxStr, 10) : -1;
+                if (idx >= 0) { selectEvidence(idx); }
+            }
+        });
+    });
+
+    document.addEventListener('click', function() {
+        hideEvidenceContextMenu();
+    });
+    document.addEventListener('keydown', function(event) {
+        if (event.key === 'Escape') { hideEvidenceContextMenu(); }
+    });
+}
+
+function flashEvidenceCopyButton(idx) {
+    var btn = document.getElementById('evidence-copy-url-' + idx);
+    if (!btn) { return; }
+    var original = btn.textContent;
+    btn.textContent = '✓';
+    btn.classList.add('copied');
+    setTimeout(function() {
+        btn.textContent = original || '⧉';
+        btn.classList.remove('copied');
+    }, 1100);
 }
 
 // ── Messages from extension ──────────────────────────────────
@@ -1376,22 +2125,48 @@ window.addEventListener('message', function(event) {
         var idx = evidencePendingIdx[msg.filename];
         if (idx === undefined) { return; }
         delete evidencePendingIdx[msg.filename];
-        var loading = document.getElementById('evidence-loading-' + idx);
-        var textarea = document.getElementById('evidence-textarea-' + idx);
-        var actions = document.getElementById('evidence-edit-actions-' + idx);
+        var loading = document.getElementById('evidence-detail-loading');
+        var body = document.getElementById('evidence-detail-md');
+        var raw = msg.content || '';
+        var normalized = normalizeEvidenceContent(raw);
+        evidenceLoaded[idx] = true;
+        evidenceContentByIdx[idx] = normalized;
+        evidenceRawContentByIdx[idx] = raw;
         if (loading) { loading.style.display = 'none'; }
-        if (textarea) {
-            textarea.value = msg.content || '';
-            textarea.style.display = 'block';
-            textarea.focus();
+        if (body && selectedEvidenceIdx === idx) {
+            body.innerHTML = renderMarkdown(normalized);
         }
-        if (actions) { actions.style.display = 'flex'; }
     }
 
     if (msg.command === 'saveError') {
         console.error('Save error:', msg.error);
     }
+
+    if (msg.command === 'copyPlanIdResult') {
+        var copyBtn = document.getElementById('copy-plan-id-btn');
+        if (!copyBtn) { return; }
+        var original = copyBtn.textContent;
+        copyBtn.textContent = msg.ok ? '✓' : '!';
+        setTimeout(function() {
+            copyBtn.textContent = original || '⧉';
+        }, 1200);
+    }
+
+    if (msg.command === 'copyEvidenceResult') {
+        if (msg.ok && typeof msg.idx === 'number') {
+            if (msg.kind === 'url') {
+                flashEvidenceCopyButton(msg.idx);
+            }
+            return;
+        }
+        console.error('Evidence copy failed:', msg.kind);
+    }
 });
+
+wireEvidenceRowContextMenu();
+if (Array.isArray(evidenceEntries) && evidenceEntries.length > 0) {
+    selectEvidence(0);
+}
 </script>
 </body>
 </html>`;
