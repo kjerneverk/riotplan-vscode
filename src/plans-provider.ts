@@ -10,14 +10,10 @@ import { HttpMcpClient } from './mcp-client';
 type PlanCategory = 'active' | 'done' | 'hold';
 const TREE_MIME = 'application/vnd.code.tree.riotplan-plans';
 
-type PlanCategory = 'active' | 'done' | 'hold';
-const TREE_MIME = 'application/vnd.code.tree.riotplan-plans';
-
 export class PlanItem extends vscode.TreeItem {
     constructor(
         public readonly label: string,
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
-        public readonly category?: PlanCategory,
         public readonly category?: PlanCategory,
         public readonly path?: string,
         public readonly uuid?: string,
@@ -42,8 +38,6 @@ export class PlanItem extends vscode.TreeItem {
             if (progress) {
                 this.description = `${stage} - ${progress.percentage}%`;
             }
-        } else if (category) {
-            this.contextValue = 'plan-category';
         } else if (category) {
             this.contextValue = 'plan-category';
         }
@@ -79,18 +73,13 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
                 new PlanItem('Active', vscode.TreeItemCollapsibleState.Expanded, 'active'),
                 new PlanItem('Done', vscode.TreeItemCollapsibleState.Collapsed, 'done'),
                 new PlanItem('Hold', vscode.TreeItemCollapsibleState.Collapsed, 'hold'),
-                new PlanItem('Active', vscode.TreeItemCollapsibleState.Expanded, 'active'),
-                new PlanItem('Done', vscode.TreeItemCollapsibleState.Collapsed, 'done'),
-                new PlanItem('Hold', vscode.TreeItemCollapsibleState.Collapsed, 'hold'),
             ];
         }
 
         // Category level - show plans
         const category = this.resolveCategoryFromLabel(element.label);
-        const category = this.resolveCategoryFromLabel(element.label);
 
         try {
-            const plans = await this.fetchPlans(category);
             const plans = await this.fetchPlans(category);
 
             return plans.map(
@@ -98,7 +87,6 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
                     new PlanItem(
                         plan.name || plan.title || plan.id,
                         vscode.TreeItemCollapsibleState.None,
-                        category,
                         category,
                         plan.path,
                         plan.uuid,
