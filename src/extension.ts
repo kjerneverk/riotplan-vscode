@@ -60,7 +60,7 @@ let plansProvider: PlansTreeProvider;
 let projectsProvider: ProjectsTreeProvider;
 let statusProvider: StatusTreeProvider;
 let dashboardProvider: DashboardViewProvider;
-let currentServerUrl = 'http://127.0.0.1:3002';
+let currentServerUrl = 'http://127.0.0.1:3001';
 let extensionContextRef: vscode.ExtensionContext;
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -68,7 +68,7 @@ export async function activate(context: vscode.ExtensionContext) {
     extensionContextRef = context;
 
     const config = vscode.workspace.getConfiguration('riotplan');
-    currentServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3002');
+    currentServerUrl = config.get<string>('serverUrl', 'http://127.0.0.1:3001');
 
     mcpClient = new HttpMcpClient(currentServerUrl);
     plansProvider = new PlansTreeProvider(mcpClient);
@@ -271,7 +271,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 title: 'RiotPlan Server URL',
                 prompt: 'Set RiotPlan HTTP MCP server URL',
                 value: currentServerUrl,
-                placeHolder: 'http://127.0.0.1:3002',
+                placeHolder: 'http://127.0.0.1:3001',
                 validateInput: (value) => {
                     try {
                         const parsed = new URL(value.trim());
@@ -477,7 +477,7 @@ export async function activate(context: vscode.ExtensionContext) {
             if (e.affectsConfiguration('riotplan.serverUrl')) {
                 const newUrl = vscode.workspace
                     .getConfiguration('riotplan')
-                    .get<string>('serverUrl', 'http://127.0.0.1:3002');
+                    .get<string>('serverUrl', 'http://127.0.0.1:3001');
                 currentServerUrl = newUrl;
                 mcpClient = new HttpMcpClient(newUrl);
                 plansProvider.updateClient(mcpClient);
@@ -575,14 +575,21 @@ async function resolveProjectFromSource(
 
 async function checkConnection(serverUrl: string): Promise<void> {
     statusProvider.setConnectionState('checking');
-    const isHealthy = await mcpClient.healthCheck();
-    if (isHealthy) {
+    const result = await mcpClient.verifyRiotPlanServer();
+    if (result.ok) {
         statusProvider.setConnectionState('connected');
     } else {
         statusProvider.setConnectionState('disconnected');
-        vscode.window.showWarningMessage(
-            `RiotPlan server not available at ${serverUrl}. Please start the server and reload the window.`
-        );
+        if (result.reason === 'missing_riotplan_tools') {
+            vscode.window.showWarningMessage(
+                `Server at ${serverUrl} is reachable but does not appear to be a RiotPlan MCP server (missing riotplan_* tools). ` +
+                `Check riotplan.serverUrl in settings.`
+            );
+        } else {
+            vscode.window.showWarningMessage(
+                `RiotPlan server not available at ${serverUrl}. Please start the server and reload the window.`
+            );
+        }
     }
 }
 
