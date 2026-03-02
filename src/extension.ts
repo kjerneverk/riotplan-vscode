@@ -86,6 +86,19 @@ export async function activate(context: vscode.ExtensionContext) {
         });
     }
 
+    function applyServerUrl(newUrl: string): void {
+        currentServerUrl = newUrl;
+        mcpClient = new HttpMcpClient(newUrl);
+        plansProvider.updateClient(mcpClient);
+        statusProvider.updateClient(mcpClient, newUrl);
+        dashboardProvider.setClient(mcpClient);
+        projectsProvider.updateClient(mcpClient);
+        syncDashboardFilters();
+        plansProvider.refresh();
+        projectsProvider.refresh();
+        void checkConnection(newUrl);
+    }
+
     // Register tree views
     const plansTreeView = vscode.window.createTreeView('riotplan-plans', {
         treeDataProvider: plansProvider,
@@ -287,9 +300,19 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!input) {
                 return;
             }
-            await vscode.workspace
-                .getConfiguration('riotplan')
-                .update('serverUrl', input.trim(), vscode.ConfigurationTarget.Global);
+            const nextUrl = input.trim();
+            const config = vscode.workspace.getConfiguration('riotplan');
+            const inspected = config.inspect<string>('serverUrl');
+            const target =
+                inspected?.workspaceFolderValue !== undefined
+                    ? vscode.ConfigurationTarget.WorkspaceFolder
+                    : inspected?.workspaceValue !== undefined
+                        ? vscode.ConfigurationTarget.Workspace
+                        : vscode.ConfigurationTarget.Global;
+
+            await config.update('serverUrl', nextUrl, target);
+            // Apply immediately so the active session switches even before configuration events propagate.
+            applyServerUrl(nextUrl);
         })
     );
 
@@ -478,16 +501,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 const newUrl = vscode.workspace
                     .getConfiguration('riotplan')
                     .get<string>('serverUrl', 'http://127.0.0.1:3001');
-                currentServerUrl = newUrl;
-                mcpClient = new HttpMcpClient(newUrl);
-                plansProvider.updateClient(mcpClient);
-                statusProvider.updateClient(mcpClient, newUrl);
-                dashboardProvider.setClient(mcpClient);
-                projectsProvider.updateClient(mcpClient);
-                syncDashboardFilters();
-                plansProvider.refresh();
-                projectsProvider.refresh();
-                checkConnection(newUrl);
+                applyServerUrl(newUrl);
             }
         })
     );
