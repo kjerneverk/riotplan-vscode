@@ -666,6 +666,93 @@ export class HttpMcpClient {
         return result;
     }
 
+    private parseToolTextResult(result: any): any {
+        if (result?.content?.[0]?.type === 'text') {
+            try {
+                return JSON.parse(result.content[0].text);
+            } catch {
+                return result.content[0].text;
+            }
+        }
+        return result;
+    }
+
+    async removeEvidence(planPathOrId: string, evidenceRefValue: string): Promise<any> {
+        const trimmedRef = typeof evidenceRefValue === 'string' ? evidenceRefValue.trim() : '';
+        if (!trimmedRef) {
+            throw new Error('Missing evidence reference');
+        }
+
+        const deleteAttempts: Array<Record<string, unknown>> = [
+            { evidenceRef: { file: trimmedRef } },
+            { evidenceRef: { file: `evidence/${trimmedRef}` } },
+            { evidenceRef: { evidenceId: trimmedRef } },
+        ];
+
+        let lastError: unknown;
+        for (const attempt of deleteAttempts) {
+            try {
+                const result = await this.callToolWithArgFallback(
+                    'riotplan_evidence',
+                    {
+                        action: 'delete',
+                        planId: planPathOrId,
+                        ...attempt,
+                        confirm: true,
+                    },
+                    {
+                        action: 'delete',
+                        path: planPathOrId,
+                        ...attempt,
+                        confirm: true,
+                    }
+                );
+                return this.parseToolTextResult(result);
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError ?? new Error(`Failed to remove evidence: ${trimmedRef}`);
+    }
+
+    async renamePlan(planId: string, name: string): Promise<any> {
+        const trimmedPlanId = typeof planId === 'string' ? planId.trim() : '';
+        const trimmedName = typeof name === 'string' ? name.trim() : '';
+        if (!trimmedPlanId) {
+            throw new Error('Missing plan identifier');
+        }
+        if (!trimmedName) {
+            throw new Error('Plan name cannot be empty');
+        }
+
+        const attempts: Array<{ tool: string; args: Record<string, unknown> }> = [
+            { tool: 'riotplan_plan', args: { action: 'rename', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_plan', args: { action: 'update', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_plan', args: { action: 'set_name', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_rename_plan', args: { planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_update_plan', args: { planId: trimmedPlanId, name: trimmedName } },
+        ];
+
+        let firstError: unknown;
+        for (const attempt of attempts) {
+            try {
+                const result = await this.sendRequest('tools/call', {
+                    name: attempt.tool,
+                    arguments: attempt.args,
+                });
+                return this.parseToolTextResult(result);
+            } catch (error) {
+                if (firstError === undefined) {
+                    firstError = error;
+                }
+            }
+        }
+
+        void firstError;
+        throw new Error('Renaming plans is not supported by the connected RiotPlan server yet.');
+    }
+
     async setIdeaContent(planPathOrId: string, content: string): Promise<any> {
         const result = await this.callToolWithArgFallback(
             'riotplan_idea',

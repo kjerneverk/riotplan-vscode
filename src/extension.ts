@@ -64,6 +64,8 @@ let currentServerUrl = 'http://127.0.0.1:3002';
 let extensionContextRef: vscode.ExtensionContext;
 let currentApiKey: string | undefined;
 let currentProxyBypass = false;
+const PLAN_LIST_AUTO_REFRESH_MS = 5 * 60 * 1000;
+const PLAN_DETAIL_AUTO_REFRESH_MS = 2 * 60 * 1000;
 
 export async function activate(context: vscode.ExtensionContext) {
     console.log('RiotPlan extension is now active');
@@ -134,6 +136,31 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Check server health and update connection status
     checkConnection(currentServerUrl);
+
+    // Periodic sync:
+    // - Plan list refresh every 5 minutes
+    // - Open detail panel refresh every 2 minutes
+    const listRefreshTimer = setInterval(() => {
+        try {
+            plansProvider.refresh();
+            projectsProvider.refresh();
+        } catch {
+            // Ignore background refresh errors and keep timer alive.
+        }
+    }, PLAN_LIST_AUTO_REFRESH_MS);
+    const detailRefreshTimer = setInterval(() => {
+        try {
+            PlanDetailPanel.scheduleRefreshForAllOpenPanels();
+        } catch {
+            // Ignore background refresh errors and keep timer alive.
+        }
+    }, PLAN_DETAIL_AUTO_REFRESH_MS);
+    context.subscriptions.push(
+        new vscode.Disposable(() => {
+            clearInterval(listRefreshTimer);
+            clearInterval(detailRefreshTimer);
+        })
+    );
 
     // Register commands
     context.subscriptions.push(
@@ -407,21 +434,36 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
 
-            let updated = 0;
+            const bindingPayload = {
+                id: selected.id,
+                name: selected.name || selected.id,
+                repo: selected.repo,
+                relationship: 'primary',
+            };
+
+            const outcomes = await Promise.allSettled(
+                selectedPlans.map(async (planRef) => {
+                    await mcpClient.bindProject(planRef, bindingPayload);
+                    return planRef;
+                })
+            );
+
+            const updatedPlans = outcomes
+                .filter((outcome): outcome is PromiseFulfilledResult<string> => outcome.status === 'fulfilled')
+                .map((outcome) => outcome.value);
             const failures: string[] = [];
-            for (const planRef of selectedPlans) {
-                try {
-                    await mcpClient.bindProject(planRef, {
-                        id: selected.id,
-                        name: selected.name || selected.id,
-                        repo: selected.repo,
-                        relationship: 'primary',
-                    });
-                    updated += 1;
-                } catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    failures.push(`${planRef}: ${message}`);
+            outcomes.forEach((outcome, index) => {
+                if (outcome.status === 'fulfilled') {
+                    return;
                 }
+                const ref = selectedPlans[index] || 'unknown-plan';
+                const message = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+                failures.push(`${ref}: ${message}`);
+            });
+            const updated = updatedPlans.length;
+
+            for (const planRef of updatedPlans) {
+                PlanDetailPanel.applyProjectBindingUpdate(planRef, bindingPayload);
             }
 
             plansProvider.refresh();
@@ -445,6 +487,55 @@ export async function activate(context: vscode.ExtensionContext) {
 
             vscode.window.showErrorMessage('Failed to update project for selected plans.');
             console.error('Failed to update plan project bindings:', failures);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('riotplan.renamePlan', async (plan: PlanSelectionInput, currentName?: string) => {
+            const planRef = resolvePlanRef(plan);
+            if (!planRef) {
+                vscode.window.showWarningMessage('Unable to determine plan reference for this item.');
+                return;
+            }
+
+            const initialValue = (typeof currentName === 'string' && currentName.trim())
+                || (typeof plan?.label === 'string' && plan.label.trim())
+                || planRef;
+            const nextName = await vscode.window.showInputBox({
+                title: 'Rename Plan',
+                prompt: 'Enter a new plan title',
+                value: initialValue,
+                ignoreFocusOut: true,
+                validateInput: (value) => {
+                    if (!value || !value.trim()) {
+                        return 'Plan title is required.';
+                    }
+                    if (value.trim().length > 120) {
+                        return 'Plan title must be 120 characters or fewer.';
+                    }
+                    return undefined;
+                },
+            });
+            if (nextName === undefined) {
+                return;
+            }
+            const trimmedName = nextName.trim();
+            if (!trimmedName) {
+                return;
+            }
+            if (trimmedName === initialValue.trim()) {
+                return;
+            }
+
+            try {
+                await mcpClient.renamePlan(planRef, trimmedName);
+                PlanDetailPanel.applyPlanTitleUpdate(planRef, trimmedName);
+                plansProvider.refresh();
+                vscode.window.showInformationMessage(`Renamed plan to "${trimmedName}".`);
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                vscode.window.showErrorMessage(`Failed to rename plan: ${message}`);
+            }
         })
     );
 
