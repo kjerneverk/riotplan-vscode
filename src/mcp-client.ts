@@ -7,6 +7,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import { URL } from 'url';
+import { getProxyAgent } from './proxyUtils';
 
 interface McpRequest {
     jsonrpc: '2.0';
@@ -47,7 +48,8 @@ export class HttpMcpClient {
 
     constructor(
         private serverUrl: string,
-        private apiKey?: string
+        private apiKey?: string,
+        private proxyBypass = false
     ) {}
 
     get baseUrl(): string {
@@ -169,8 +171,9 @@ export class HttpMcpClient {
             const client = isHttps ? https : http;
 
             const postData = JSON.stringify(body);
+            const proxyAgent = getProxyAgent(url.toString(), this.proxyBypass);
 
-            const options = {
+            const options: http.RequestOptions = {
                 hostname: url.hostname,
                 port: url.port || (isHttps ? 443 : 80),
                 path: url.pathname,
@@ -183,6 +186,7 @@ export class HttpMcpClient {
                     ...(this.sessionId ? { 'Mcp-Session-Id': this.sessionId } : {}),
                     ...this.getAuthHeaders(),
                 },
+                ...(proxyAgent ? { agent: proxyAgent } : {}),
             };
 
             const req = client.request(options, (res) => {
@@ -235,6 +239,7 @@ export class HttpMcpClient {
             const url = new URL(this.serverUrl + path);
             const isHttps = url.protocol === 'https:';
             const client = isHttps ? https : http;
+            const proxyAgent = getProxyAgent(url.toString(), this.proxyBypass);
             const req = client.request(
                 {
                     hostname: url.hostname,
@@ -245,6 +250,7 @@ export class HttpMcpClient {
                         ...this.getAuthHeaders(),
                         ...(options?.headers || {}),
                     },
+                    ...(proxyAgent ? { agent: proxyAgent } : {}),
                 },
                 (res) => {
                     const chunks: Buffer[] = [];
@@ -660,6 +666,116 @@ export class HttpMcpClient {
         return result;
     }
 
+    private parseToolTextResult(result: any): any {
+        if (result?.content?.[0]?.type === 'text') {
+            try {
+                return JSON.parse(result.content[0].text);
+            } catch {
+                return result.content[0].text;
+            }
+        }
+        return result;
+    }
+
+    private async sleep(ms: number): Promise<void> {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    private isTransientEvidenceDeleteError(error: unknown): boolean {
+        const message = String(error || '').toLowerCase();
+        const isSyncIndexTmpRace =
+            message.includes('enoent')
+            && message.includes('sync-index')
+            && message.includes('.tmp');
+        return isSyncIndexTmpRace
+            || message.includes('sqlite_busy')
+            || message.includes('database is locked')
+            || message.includes('resource temporarily unavailable');
+    }
+
+    async removeEvidence(planPathOrId: string, evidenceRefValue: string): Promise<any> {
+        const trimmedRef = typeof evidenceRefValue === 'string' ? evidenceRefValue.trim() : '';
+        if (!trimmedRef) {
+            throw new Error('Missing evidence reference');
+        }
+
+        const deleteAttempts: Array<Record<string, unknown>> = [
+            { evidenceRef: { file: trimmedRef } },
+            { evidenceRef: { file: `evidence/${trimmedRef}` } },
+            { evidenceRef: { evidenceId: trimmedRef } },
+        ];
+
+        let lastError: unknown;
+        for (const attempt of deleteAttempts) {
+            for (let retry = 0; retry < 3; retry += 1) {
+                try {
+                    const result = await this.callToolWithArgFallback(
+                        'riotplan_evidence',
+                        {
+                            action: 'delete',
+                            planId: planPathOrId,
+                            ...attempt,
+                            confirm: true,
+                        },
+                        {
+                            action: 'delete',
+                            path: planPathOrId,
+                            ...attempt,
+                            confirm: true,
+                        }
+                    );
+                    return this.parseToolTextResult(result);
+                } catch (error) {
+                    lastError = error;
+                    const shouldRetry = this.isTransientEvidenceDeleteError(error) && retry < 2;
+                    if (!shouldRetry) {
+                        break;
+                    }
+                    await this.sleep(200 * (retry + 1));
+                }
+            }
+        }
+
+        throw lastError ?? new Error(`Failed to remove evidence: ${trimmedRef}`);
+    }
+
+    async renamePlan(planId: string, name: string): Promise<any> {
+        const trimmedPlanId = typeof planId === 'string' ? planId.trim() : '';
+        const trimmedName = typeof name === 'string' ? name.trim() : '';
+        if (!trimmedPlanId) {
+            throw new Error('Missing plan identifier');
+        }
+        if (!trimmedName) {
+            throw new Error('Plan name cannot be empty');
+        }
+
+        const attempts: Array<{ tool: string; args: Record<string, unknown> }> = [
+            { tool: 'riotplan_plan', args: { action: 'rename', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_plan', args: { action: 'update', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_plan', args: { action: 'set_name', planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_rename_plan', args: { planId: trimmedPlanId, name: trimmedName } },
+            { tool: 'riotplan_update_plan', args: { planId: trimmedPlanId, name: trimmedName } },
+        ];
+
+        let firstError: unknown;
+        for (const attempt of attempts) {
+            try {
+                const result = await this.sendRequest('tools/call', {
+                    name: attempt.tool,
+                    arguments: attempt.args,
+                });
+                return this.parseToolTextResult(result);
+            } catch (error) {
+                if (firstError === undefined) {
+                    firstError = error;
+                }
+            }
+        }
+
+        void firstError;
+        throw new Error('Renaming plans is not supported by the connected RiotPlan server yet.');
+    }
+
     async setIdeaContent(planPathOrId: string, content: string): Promise<any> {
         const result = await this.callToolWithArgFallback(
             'riotplan_idea',
@@ -681,9 +797,13 @@ export class HttpMcpClient {
             const url = new URL(this.serverUrl + '/health');
             const isHttps = url.protocol === 'https:';
             const client = isHttps ? https : http;
+            const proxyAgent = getProxyAgent(url.toString(), this.proxyBypass);
 
             return new Promise((resolve) => {
-                const req = client.get(url, { headers: this.getAuthHeaders() }, (res) => {
+                const req = client.get(url, {
+                    headers: this.getAuthHeaders(),
+                    ...(proxyAgent ? { agent: proxyAgent } : {}),
+                }, (res) => {
                     resolve(res.statusCode === 200);
                 });
 
@@ -810,6 +930,7 @@ export class HttpMcpClient {
         const url = new URL(`${this.serverUrl}/mcp`);
         const isHttps = url.protocol === 'https:';
         const client = isHttps ? https : http;
+        const proxyAgent = getProxyAgent(url.toString(), this.proxyBypass);
         const req = client.request(
             {
                 hostname: url.hostname,
@@ -822,6 +943,7 @@ export class HttpMcpClient {
                     'Mcp-Session-Id': this.sessionId,
                     ...this.getAuthHeaders(),
                 },
+                ...(proxyAgent ? { agent: proxyAgent } : {}),
             },
             (res) => {
                 if (res.statusCode !== 200) {

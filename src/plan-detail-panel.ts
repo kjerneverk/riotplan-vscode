@@ -19,6 +19,7 @@ export class PlanDetailPanel {
     private unsubscribeNotification?: () => void;
     private unsubscribeSessionRecovered?: () => void;
     private refreshTimer?: ReturnType<typeof setTimeout>;
+    private projectMetaRefreshTimer?: ReturnType<typeof setTimeout>;
     private readonly subscribedResourceUris = new Set<string>();
 
     private constructor(
@@ -46,14 +47,46 @@ export class PlanDetailPanel {
         }
     }
 
+    static applyProjectBindingUpdate(planPath: string, project: any): void {
+        const panel = PlanDetailPanel.currentPanels.get(planPath);
+        if (!panel) {
+            return;
+        }
+        panel.postProjectMetaUpdate(project || null);
+    }
+
+    static applyPlanTitleUpdate(planPath: string, title: string): void {
+        const panel = PlanDetailPanel.currentPanels.get(planPath);
+        if (!panel) {
+            return;
+        }
+        panel._panel.title = title;
+        panel._panel.webview.postMessage({
+            command: 'planTitleUpdated',
+            title,
+        });
+    }
+
+    static scheduleRefreshForAllOpenPanels(): void {
+        for (const panel of PlanDetailPanel.currentPanels.values()) {
+            panel.scheduleRefresh();
+        }
+    }
+
     private bindClientSubscriptions(): void {
         this.unsubscribeNotification = this.mcpClient.onNotification(
             'notifications/resource_changed',
             async (data: unknown) => {
                 const uris = this.extractNotificationUris(data);
-                if (uris.some((uri) => this.resourceMatchesPlan(uri))) {
-                    this.scheduleRefresh();
+                const matchingUris = uris.filter((uri) => this.resourceMatchesPlan(uri));
+                if (matchingUris.length === 0) {
+                    return;
                 }
+                if (matchingUris.every((uri) => this.isExactPlanResourceUri(uri))) {
+                    this.scheduleProjectMetaRefresh();
+                    return;
+                }
+                this.scheduleRefresh();
             }
         );
         this.unsubscribeSessionRecovered = this.mcpClient.onSessionRecovered(async () => {
@@ -128,17 +161,32 @@ export class PlanDetailPanel {
             case 'addEvidence':
                 await this._addEvidence(msg.description, msg.source, msg.summary, msg.content);
                 break;
+            case 'removeEvidence':
+                await this._removeEvidence(msg.filename, msg.filenames, msg.idx);
+                break;
             case 'copyPlanId':
                 await this._copyPlanIdToClipboard();
                 break;
             case 'copyEvidenceUrl':
-                await this._copyEvidenceUrlToClipboard(msg.filename, msg.idx);
+                await this._copyEvidenceUrlToClipboard(msg.filename, msg.idx, msg.filenames);
                 break;
             case 'copyEvidenceContent':
-                await this._copyEvidenceContentToClipboard(msg.filename, msg.content, msg.idx);
+                await this._copyEvidenceContentToClipboard(
+                    msg.filename,
+                    msg.content,
+                    msg.idx,
+                    msg.filenames,
+                    msg.contentsByFilename
+                );
                 break;
             case 'openProjectEntity':
                 await this._openProjectEntity(msg.project);
+                break;
+            case 'changePlanProject':
+                await this._changePlanProject();
+                break;
+            case 'renamePlan':
+                await this._renamePlan(msg.currentTitle);
                 break;
         }
     }
@@ -147,10 +195,11 @@ export class PlanDetailPanel {
         this._panel.webview.html = this._getLoadingHtml();
 
         try {
-            const [status, context, planResource, summaryArtifact, executionPlanArtifact, steps] = await Promise.all([
+            const [status, context, planResource, projectBinding, summaryArtifact, executionPlanArtifact, steps] = await Promise.all([
                 this.mcpClient.getPlanStatus(this.planPath),
                 this.mcpClient.readContext(this.planPath).catch(() => null),
                 this.mcpClient.getPlanResource(this.planPath).catch(() => null),
+                this.mcpClient.getProjectBinding(this.planPath).catch(() => null),
                 this.mcpClient.getArtifact(this.planPath, 'summary').catch(() => null),
                 this.mcpClient.getExecutionPlan(this.planPath).catch(() => null),
                 this.mcpClient.listSteps(this.planPath).catch(() => []),
@@ -167,7 +216,13 @@ export class PlanDetailPanel {
                 steps: Array.isArray(steps) ? steps : [],
             };
 
-            this._panel.webview.html = this._getHtml(statusWithSteps, enrichedContext, planResource);
+            const boundProject = projectBinding?.project || null;
+            const effectivePlanResource = {
+                ...(planResource || {}),
+                project: boundProject || planResource?.project || this.initialProject || null,
+            };
+
+            this._panel.webview.html = this._getHtml(statusWithSteps, enrichedContext, effectivePlanResource);
         } catch (error) {
             this._panel.webview.html = this._getErrorHtml(String(error));
         }
@@ -181,6 +236,37 @@ export class PlanDetailPanel {
             this.refreshTimer = undefined;
             void this._loadContent();
         }, 250);
+    }
+
+    private scheduleProjectMetaRefresh(): void {
+        if (this.projectMetaRefreshTimer) {
+            clearTimeout(this.projectMetaRefreshTimer);
+        }
+        this.projectMetaRefreshTimer = setTimeout(() => {
+            this.projectMetaRefreshTimer = undefined;
+            void this.refreshProjectMetadata();
+        }, 180);
+    }
+
+    private async refreshProjectMetadata(): Promise<void> {
+        try {
+            const [planResource, projectBinding] = await Promise.all([
+                this.mcpClient.getPlanResource(this.planPath).catch(() => null),
+                this.mcpClient.getProjectBinding(this.planPath).catch(() => null),
+            ]);
+            const project = projectBinding?.project || planResource?.project || this.initialProject || null;
+            const projectPath =
+                typeof planResource?.metadata?.projectPath === 'string'
+                    ? planResource.metadata.projectPath
+                    : '';
+            const repoUrl =
+                typeof project?.repo?.url === 'string'
+                    ? project.repo.url
+                    : '';
+            this.postProjectMetaUpdate(project, projectPath, repoUrl);
+        } catch {
+            // Ignore metadata refresh errors to avoid interrupting the panel.
+        }
     }
 
     private getPlanResourceUris(): string[] {
@@ -241,6 +327,26 @@ export class PlanDetailPanel {
                 normalized.includes(normalizedPlanPath) ||
                 normalized.includes(encodedPlanPath)
             );
+        });
+    }
+
+    private isExactPlanResourceUri(uri: string): boolean {
+        const target = this.resourceUri.toLowerCase();
+        const candidates = [uri];
+        try {
+            candidates.push(decodeURIComponent(uri));
+        } catch {
+            // Ignore malformed URI encoding and just use original URI.
+        }
+        return candidates.some((candidate) => candidate.toLowerCase() === target);
+    }
+
+    private postProjectMetaUpdate(project: any, projectPath = '', repoUrl = ''): void {
+        this._panel.webview.postMessage({
+            command: 'projectMetaUpdated',
+            project,
+            projectPath,
+            repoUrl,
         });
     }
 
@@ -307,6 +413,115 @@ export class PlanDetailPanel {
         }
     }
 
+    private async _removeEvidence(filename?: string, filenames?: string[], idx?: number): Promise<void> {
+        try {
+            const resolvedFilenames = this._resolveEvidenceFilenames(filename, filenames);
+            if (resolvedFilenames.length === 0) {
+                throw new Error('Missing evidence filename');
+            }
+            const itemCount = resolvedFilenames.length;
+            const confirmationMessage = itemCount === 1
+                ? 'Remove this evidence entry? This cannot be undone.'
+                : `Remove ${itemCount} evidence entries? This cannot be undone.`;
+            const confirmation = await vscode.window.showWarningMessage(
+                confirmationMessage,
+                { modal: true },
+                'Remove Evidence'
+            );
+            if (confirmation !== 'Remove Evidence') {
+                this._panel.webview.postMessage({ command: 'removeEvidenceResult', ok: false, cancelled: true, idx });
+                return;
+            }
+            this._panel.webview.postMessage({
+                command: 'evidenceRemovalPending',
+                pending: true,
+                filenames: resolvedFilenames,
+            });
+
+            const removed: string[] = [];
+            const failures: string[] = [];
+
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: itemCount === 1 ? 'Removing evidence…' : `Removing ${itemCount} evidence entries…`,
+                    cancellable: false,
+                },
+                async (progress) => {
+                    const maxParallel = Math.min(3, itemCount);
+                    let completed = 0;
+                    let nextIndex = 0;
+                    const incrementPerItem = 100 / itemCount;
+
+                    const runWorker = async (): Promise<void> => {
+                        while (nextIndex < itemCount) {
+                            const currentIndex = nextIndex;
+                            nextIndex += 1;
+                            const currentFilename = resolvedFilenames[currentIndex];
+                            try {
+                                await this.mcpClient.removeEvidence(this.planPath, currentFilename);
+                                removed.push(currentFilename);
+                            } catch (error) {
+                                failures.push(String(error));
+                            }
+                            completed += 1;
+                            progress.report({
+                                increment: incrementPerItem,
+                                message: `${completed}/${itemCount}`,
+                            });
+                        }
+                    };
+
+                    await Promise.all(
+                        Array.from({ length: maxParallel }, async () => runWorker())
+                    );
+                    if (completed < itemCount) {
+                        progress.report({ increment: 100, message: `${itemCount}/${itemCount}` });
+                    }
+                }
+            );
+
+            if (removed.length > 0) {
+                this._panel.webview.postMessage({
+                    command: 'removeEvidenceResult',
+                    ok: true,
+                    idx,
+                    removed,
+                });
+            }
+
+            if (failures.length > 0) {
+                const firstFailure = failures[0];
+                const failureMessage =
+                    failures.length === 1
+                        ? firstFailure
+                        : `${failures.length} evidence removals failed; first error: ${firstFailure}`;
+                if (removed.length === 0) {
+                    this._panel.webview.postMessage({ command: 'removeEvidenceResult', ok: false, idx });
+                    throw new Error(failureMessage);
+                }
+                vscode.window.showWarningMessage(
+                    `Some evidence could not be removed (${failures.length}/${itemCount}). ${failureMessage}`
+                );
+            }
+
+            vscode.window.setStatusBarMessage(
+                itemCount === 1
+                    ? 'Removed evidence item'
+                    : `Removed ${removed.length} evidence items`,
+                2500
+            );
+        } catch (error) {
+            this._panel.webview.postMessage({ command: 'removeEvidenceResult', ok: false, idx });
+            vscode.window.showErrorMessage(`Failed to remove evidence: ${error}`);
+        } finally {
+            this._panel.webview.postMessage({
+                command: 'evidenceRemovalPending',
+                pending: false,
+            });
+        }
+    }
+
     private async _copyPlanIdToClipboard(): Promise<void> {
         try {
             await vscode.env.clipboard.writeText(this.planPath);
@@ -318,31 +533,109 @@ export class PlanDetailPanel {
         }
     }
 
-    private async _copyEvidenceUrlToClipboard(filename: string, idx?: number): Promise<void> {
+    private _resolveEvidenceFilenames(
+        filename?: string,
+        filenames?: string[]
+    ): string[] {
+        const raw = Array.isArray(filenames) && filenames.length > 0
+            ? filenames
+            : (typeof filename === 'string' ? [filename] : []);
+        const deduped = new Set<string>();
+        for (const name of raw) {
+            if (typeof name !== 'string') {
+                continue;
+            }
+            const trimmed = name.trim();
+            if (!trimmed) {
+                continue;
+            }
+            deduped.add(trimmed);
+        }
+        return Array.from(deduped);
+    }
+
+    private async _copyEvidenceUrlToClipboard(
+        filename?: string,
+        idx?: number,
+        filenames?: string[]
+    ): Promise<void> {
         try {
-            if (!filename || typeof filename !== 'string') {
+            const resolvedFilenames = this._resolveEvidenceFilenames(filename, filenames);
+            if (resolvedFilenames.length === 0) {
                 throw new Error('Missing evidence filename');
             }
-            const evidenceUrl = `riotplan://evidence-file/${this.planPath}?file=${encodeURIComponent(filename)}`;
-            await vscode.env.clipboard.writeText(evidenceUrl);
-            vscode.window.setStatusBarMessage('Copied evidence URL to clipboard', 2000);
-            this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: true, kind: 'url', idx });
+            const evidenceUrls = resolvedFilenames
+                .map((name) => `riotplan://evidence-file/${this.planPath}?file=${encodeURIComponent(name)}`)
+                .join('\n');
+            await vscode.env.clipboard.writeText(evidenceUrls);
+            const itemCount = resolvedFilenames.length;
+            vscode.window.setStatusBarMessage(
+                itemCount === 1
+                    ? 'Copied evidence URL to clipboard'
+                    : `Copied ${itemCount} evidence URLs to clipboard`,
+                2000
+            );
+            this._panel.webview.postMessage({
+                command: 'copyEvidenceResult',
+                ok: true,
+                kind: 'url',
+                idx,
+            });
         } catch (error) {
             this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: false, kind: 'url', idx });
             vscode.window.showErrorMessage(`Failed to copy evidence URL: ${error}`);
         }
     }
 
-    private async _copyEvidenceContentToClipboard(filename: string, content?: string, idx?: number): Promise<void> {
+    private async _copyEvidenceContentToClipboard(
+        filename?: string,
+        content?: string,
+        idx?: number,
+        filenames?: string[],
+        contentsByFilename?: Record<string, string>
+    ): Promise<void> {
         try {
-            if (!filename || typeof filename !== 'string') {
+            const resolvedFilenames = this._resolveEvidenceFilenames(filename, filenames);
+            if (resolvedFilenames.length === 0) {
                 throw new Error('Missing evidence filename');
             }
-            const text = typeof content === 'string' && content.length > 0
-                ? content
-                : await this.mcpClient.getEvidenceContent(this.planPath, filename);
-            await vscode.env.clipboard.writeText(text || '');
-            vscode.window.setStatusBarMessage('Copied evidence content to clipboard', 2000);
+            const normalizedContentsByFilename =
+                contentsByFilename && typeof contentsByFilename === 'object'
+                    ? contentsByFilename
+                    : {};
+
+            const collected: string[] = [];
+            for (const currentFilename of resolvedFilenames) {
+                const hasInlineSingleContent =
+                    resolvedFilenames.length === 1 &&
+                    typeof content === 'string' &&
+                    content.length > 0;
+                const inlineContent = hasInlineSingleContent
+                    ? content
+                    : normalizedContentsByFilename[currentFilename];
+                const text =
+                    typeof inlineContent === 'string' && inlineContent.length > 0
+                        ? inlineContent
+                        : await this.mcpClient.getEvidenceContent(this.planPath, currentFilename);
+                if (resolvedFilenames.length > 1) {
+                    collected.push(`# ${currentFilename}\n\n${text || ''}`);
+                } else {
+                    collected.push(text || '');
+                }
+            }
+
+            const clipboardText = resolvedFilenames.length > 1
+                ? collected.join('\n\n---\n\n')
+                : (collected[0] || '');
+
+            await vscode.env.clipboard.writeText(clipboardText);
+            const itemCount = resolvedFilenames.length;
+            vscode.window.setStatusBarMessage(
+                itemCount === 1
+                    ? 'Copied evidence content to clipboard'
+                    : `Copied ${itemCount} evidence contents to clipboard`,
+                2000
+            );
             this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: true, kind: 'content', idx });
         } catch (error) {
             this._panel.webview.postMessage({ command: 'copyEvidenceResult', ok: false, kind: 'content', idx });
@@ -359,10 +652,23 @@ export class PlanDetailPanel {
         await vscode.commands.executeCommand('riotplan.openProjectEntity', project);
     }
 
+    private async _changePlanProject(): Promise<void> {
+        await vscode.commands.executeCommand('riotplan.changePlanProject', this.planPath);
+    }
+
+    private async _renamePlan(currentTitle?: string): Promise<void> {
+        const title = typeof currentTitle === 'string' ? currentTitle.trim() : '';
+        await vscode.commands.executeCommand('riotplan.renamePlan', this.planPath, title);
+    }
+
     private dispose(): void {
         if (this.refreshTimer) {
             clearTimeout(this.refreshTimer);
             this.refreshTimer = undefined;
+        }
+        if (this.projectMetaRefreshTimer) {
+            clearTimeout(this.projectMetaRefreshTimer);
+            this.projectMetaRefreshTimer = undefined;
         }
         this.unsubscribeNotification?.();
         this.unsubscribeNotification = undefined;
@@ -516,7 +822,7 @@ export class PlanDetailPanel {
                 const addedLabel = addedDate && !Number.isNaN(addedDate.getTime())
                     ? `Added ${addedDate.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`
                     : 'Added date unknown';
-                return `<div class="evidence-row" role="button" tabindex="0" data-evidence-idx="${idx}" onclick="selectEvidence(${idx})">
+                return `<div class="evidence-row" role="button" tabindex="0" data-evidence-idx="${idx}" onclick="selectEvidence(${idx}, event)">
   <span class="evidence-row-icon">◫</span>
   <span class="evidence-row-body">
     <span class="evidence-row-name">${this._esc(e.title || e.name)}</span>
@@ -621,6 +927,13 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+.plan-title.editable {
+    cursor: pointer;
+    transition: color 0.15s;
+}
+.plan-title.editable:hover {
+    color: var(--vscode-textLink-foreground, #4fc3f7);
 }
 
 .badge {
@@ -1126,6 +1439,14 @@ body {
     background: rgba(79, 195, 247, 0.08);
     border-color: rgba(79, 195, 247, 0.24);
 }
+.evidence-row.selected {
+    background: rgba(79, 195, 247, 0.12);
+    border-color: rgba(79, 195, 247, 0.28);
+}
+.evidence-row.removing {
+    opacity: 0.45;
+    pointer-events: none;
+}
 .evidence-row-icon {
     color: var(--vscode-descriptionForeground);
     font-size: 12px;
@@ -1253,6 +1574,12 @@ body {
 }
 .evidence-context-item:hover {
     background: var(--vscode-list-hoverBackground, rgba(255,255,255,0.08));
+}
+.evidence-context-item.danger {
+    color: var(--vscode-errorForeground, #e57373);
+}
+.evidence-context-item.danger:hover {
+    background: rgba(229, 115, 115, 0.14);
 }
 @media (max-width: 1100px) {
     .evidence-layout {
@@ -1456,7 +1783,7 @@ body {
 <!-- ── Header ───────────────────────────────────────── -->
 <div class="header">
   <div class="title-row">
-    <h1 class="plan-title" title="${this._esc(status?.code || '')}">${name}</h1>
+    <h1 class="plan-title editable" id="plan-title-text" title="Click to rename plan">${name}</h1>
     <span class="badge" style="background:${stagePal.bg};color:${stagePal.text}">${this._esc(stage)}</span>
     ${planStatus !== stage ? `<span class="badge" style="background:${statusPal.bg};color:${statusPal.text}">${this._esc(planStatus)}</span>` : ''}
     <button class="refresh-btn" onclick="refresh()">↻ Refresh</button>
@@ -1474,9 +1801,9 @@ body {
     ${code ? `<span class="meta-item"><span class="label">code:</span> ${code}<button id="copy-plan-id-btn" class="copy-inline-btn" title="Copy plan ID">⧉</button></span>` : ''}
     ${lastUpdated ? `<span class="meta-item"><span class="label">updated:</span> ${this._esc(lastUpdated)}</span>` : ''}
     ${status?.lastCompleted ? `<span class="meta-item"><span class="label">last step:</span> ${status.lastCompleted}</span>` : ''}
-    ${projectName ? `<span class="meta-item"><span class="label">project:</span> <a href="#" id="open-project-entity-link" class="meta-link">${projectName}</a></span>` : ''}
-    ${projectPath ? `<span class="meta-item"><span class="label">project path:</span> <span class="mono">${projectPath}</span></span>` : ''}
-    ${repoUrl ? `<span class="meta-item"><span class="label">repo:</span> <a class="meta-link" href="${repoUrl}">${repoUrl}</a></span>` : ''}
+    <span class="meta-item" id="project-meta-item"${projectName ? '' : ' style="display:none"'}><span class="label">project:</span> <a href="#" id="open-project-entity-link" class="meta-link">${projectName}</a></span>
+    <span class="meta-item" id="project-path-meta-item"${projectPath ? '' : ' style="display:none"'}><span class="label">project path:</span> <span class="mono" id="project-path-meta-value">${projectPath}</span></span>
+    <span class="meta-item" id="repo-meta-item"${repoUrl ? '' : ' style="display:none"'}><span class="label">repo:</span> <a class="meta-link" id="repo-meta-link" href="${repoUrl}">${repoUrl}</a></span>
   </div>
 </div>
 
@@ -1585,6 +1912,7 @@ body {
   <div id="evidence-context-menu" class="evidence-context-menu" style="display:none">
     <button class="evidence-context-item" id="evidence-context-copy-url">Copy Evidence URL</button>
     <button class="evidence-context-item" id="evidence-context-copy-content">Copy Evidence Content</button>
+    <button class="evidence-context-item danger" id="evidence-context-remove">Remove Evidence</button>
   </div>
 </div>
 
@@ -1661,6 +1989,12 @@ function refresh() {
     vscode.postMessage({ command: 'refresh', activeTab: getActiveTab() });
 }
 function copyPlanId() { vscode.postMessage({ command: 'copyPlanId' }); }
+function changePlanProject() { vscode.postMessage({ command: 'changePlanProject' }); }
+function requestPlanRename() {
+    var titleEl = document.getElementById('plan-title-text');
+    var currentTitle = titleEl ? (titleEl.textContent || '').trim() : '';
+    vscode.postMessage({ command: 'renamePlan', currentTitle: currentTitle });
+}
 function openProjectEntity() {
     vscode.postMessage({ command: 'openProjectEntity', project: projectEntity });
 }
@@ -1811,6 +2145,51 @@ var summaryMd = ${summaryJson};
 var executionPlanMd = ${executionPlanJson};
 var evidenceEntries = ${evidenceFilesJson};
 var projectEntity = ${projectJson};
+
+function updateProjectMeta(project, projectPath, repoUrl) {
+    projectEntity = project || null;
+
+    var projectItem = document.getElementById('project-meta-item');
+    var projectLink = document.getElementById('open-project-entity-link');
+    var projectName = '';
+    if (project && typeof project === 'object') {
+        var rawName = project.name || project.id;
+        if (typeof rawName === 'string') {
+            projectName = rawName;
+        }
+    }
+    if (projectItem) {
+        projectItem.style.display = projectName ? '' : 'none';
+    }
+    if (projectLink) {
+        projectLink.textContent = projectName;
+    }
+
+    var projectPathItem = document.getElementById('project-path-meta-item');
+    var projectPathValueEl = document.getElementById('project-path-meta-value');
+    var normalizedProjectPath = typeof projectPath === 'string' ? projectPath.trim() : '';
+    if (projectPathItem) {
+        projectPathItem.style.display = normalizedProjectPath ? '' : 'none';
+    }
+    if (projectPathValueEl) {
+        projectPathValueEl.textContent = normalizedProjectPath;
+    }
+
+    var normalizedRepoUrl = typeof repoUrl === 'string' ? repoUrl.trim() : '';
+    if (!normalizedRepoUrl && project && typeof project === 'object' && project.repo && typeof project.repo.url === 'string') {
+        normalizedRepoUrl = project.repo.url.trim();
+    }
+    var repoItem = document.getElementById('repo-meta-item');
+    var repoLink = document.getElementById('repo-meta-link');
+    if (repoItem) {
+        repoItem.style.display = normalizedRepoUrl ? '' : 'none';
+    }
+    if (repoLink) {
+        repoLink.textContent = normalizedRepoUrl;
+        repoLink.setAttribute('href', normalizedRepoUrl || '#');
+    }
+}
+
 try {
     var ideaEl = document.getElementById('idea-md');
     if (ideaEl && ideaMd) { ideaEl.innerHTML = renderMarkdown(ideaMd); }
@@ -1851,11 +2230,17 @@ var cancelIdeaBtn = document.getElementById('cancel-idea-btn');
 if (cancelIdeaBtn) { cancelIdeaBtn.addEventListener('click', cancelEditIdea); }
 var copyPlanIdBtn = document.getElementById('copy-plan-id-btn');
 if (copyPlanIdBtn) { copyPlanIdBtn.addEventListener('click', copyPlanId); }
+var planTitleEl = document.getElementById('plan-title-text');
+if (planTitleEl) {
+    planTitleEl.addEventListener('click', function() {
+        requestPlanRename();
+    });
+}
 var openProjectEntityLink = document.getElementById('open-project-entity-link');
 if (openProjectEntityLink) {
     openProjectEntityLink.addEventListener('click', function(event) {
         event.preventDefault();
-        openProjectEntity();
+        changePlanProject();
     });
 }
 
@@ -1930,17 +2315,183 @@ var evidenceContentByIdx = {};
 var evidenceRawContentByIdx = {};
 var selectedEvidenceIdx = -1;
 var evidenceContextIdx = -1;
+var evidenceSelectedIdxs = [];
+var evidenceSelectionAnchorIdx = -1;
+var evidenceContextMenuWired = false;
+var evidenceRemovalPendingByName = {};
 
-function selectEvidence(idx) {
+function updateEvidenceTabLabel() {
+    var evidenceTab = document.querySelector('.tab-btn[data-tab="evidence"]');
+    if (!evidenceTab) { return; }
+    var count = Array.isArray(evidenceEntries) ? evidenceEntries.length : 0;
+    evidenceTab.textContent = count > 0 ? ('Evidence (' + count + ')') : 'Evidence';
+}
+
+function renderEvidenceRows() {
+    var list = document.querySelector('#pane-evidence .evidence-list');
+    if (!list) { return; }
+    if (!Array.isArray(evidenceEntries) || evidenceEntries.length === 0) {
+        list.innerHTML = '<div class="empty-state"><span class="empty-icon">◫</span><p>No evidence files attached</p></div>';
+        return;
+    }
+    list.innerHTML = evidenceEntries.map(function(entry, idx) {
+        var addedDate = entry && entry.createdAt ? new Date(entry.createdAt) : null;
+        var addedLabel = addedDate && !Number.isNaN(addedDate.getTime())
+            ? 'Added ' + addedDate.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+            : 'Added date unknown';
+        var sizeHtml = (entry && typeof entry.size === 'number' && entry.size > 0)
+            ? '<span class="evidence-row-size">' + (entry.size / 1024).toFixed(1) + ' kb</span>'
+            : '';
+        return '<div class="evidence-row" role="button" tabindex="0" data-evidence-idx="' + idx + '" onclick="selectEvidence(' + idx + ', event)">' +
+            '<span class="evidence-row-icon">◫</span>' +
+            '<span class="evidence-row-body">' +
+                '<span class="evidence-row-name">' + escHtml(getEvidenceTitle(entry)) + '</span>' +
+                '<span class="evidence-row-id">ID: ' + escHtml(entry && entry.name ? entry.name : '') + '</span>' +
+                '<span class="evidence-row-meta">' + escHtml(addedLabel) + '</span>' +
+            '</span>' +
+            sizeHtml +
+            '<button class="evidence-row-action" id="evidence-copy-url-' + idx + '" onclick="copyEvidenceUrl(' + idx + ', event)" title="Copy Evidence URL">⧉</button>' +
+        '</div>';
+    }).join('');
+}
+
+function showEvidenceDetailEmptyState() {
+    var empty = document.getElementById('evidence-detail-empty');
+    var content = document.getElementById('evidence-detail-content');
+    var loading = document.getElementById('evidence-detail-loading');
+    var body = document.getElementById('evidence-detail-md');
+    var title = document.getElementById('evidence-detail-title');
+    var sizeEl = document.getElementById('evidence-detail-size');
+    if (empty) { empty.style.display = 'block'; }
+    if (content) { content.style.display = 'none'; }
+    if (loading) { loading.style.display = 'none'; }
+    if (body) { body.innerHTML = ''; }
+    if (title) { title.textContent = ''; }
+    if (sizeEl) { sizeEl.textContent = ''; }
+}
+
+function applyEvidenceRemoval(removedRefs) {
+    if (!Array.isArray(removedRefs) || removedRefs.length === 0) { return; }
+    var removedSet = {};
+    removedRefs.forEach(function(ref) {
+        if (typeof ref === 'string' && ref.trim()) {
+            removedSet[ref.trim()] = true;
+        }
+    });
+    evidenceEntries = (Array.isArray(evidenceEntries) ? evidenceEntries : []).filter(function(entry) {
+        var key = entry && typeof entry.name === 'string' ? entry.name.trim() : '';
+        return key ? !removedSet[key] : true;
+    });
+    evidencePendingIdx = {};
+    evidenceLoaded = {};
+    evidenceContentByIdx = {};
+    evidenceRawContentByIdx = {};
+    selectedEvidenceIdx = -1;
+    evidenceContextIdx = -1;
+    evidenceSelectedIdxs = [];
+    evidenceSelectionAnchorIdx = -1;
+    evidenceRemovalPendingByName = {};
+    hideEvidenceContextMenu();
+    renderEvidenceRows();
+    wireEvidenceRowContextMenu();
+    updateEvidenceTabLabel();
+    if (Array.isArray(evidenceEntries) && evidenceEntries.length > 0) {
+        selectEvidence(0);
+        return;
+    }
+    showEvidenceDetailEmptyState();
+}
+
+function setEvidenceRemovalPending(pending, filenames) {
+    evidenceRemovalPendingByName = {};
+    if (pending && Array.isArray(filenames)) {
+        filenames.forEach(function(name) {
+            if (typeof name === 'string' && name.trim()) {
+                evidenceRemovalPendingByName[name.trim()] = true;
+            }
+        });
+    }
+    document.querySelectorAll('.evidence-row').forEach(function(row) {
+        var idxStr = row.getAttribute('data-evidence-idx');
+        var idx = idxStr ? parseInt(idxStr, 10) : -1;
+        var entry = Array.isArray(evidenceEntries) ? evidenceEntries[idx] : undefined;
+        var name = entry && typeof entry.name === 'string' ? entry.name.trim() : '';
+        var isPending = !!(name && evidenceRemovalPendingByName[name]);
+        row.classList.toggle('removing', isPending);
+    });
+    var removeBtn = document.getElementById('evidence-context-remove');
+    if (removeBtn) {
+        removeBtn.disabled = !!pending;
+        removeBtn.textContent = pending ? 'Removing…' : 'Remove Evidence';
+    }
+}
+
+function updateEvidenceSelectionStyles() {
+    var selectedSet = {};
+    evidenceSelectedIdxs.forEach(function(i) { selectedSet[i] = true; });
+    document.querySelectorAll('.evidence-row').forEach(function(row) {
+        var idxStr = row.getAttribute('data-evidence-idx');
+        var idx = idxStr ? parseInt(idxStr, 10) : -1;
+        row.classList.toggle('selected', !!selectedSet[idx]);
+        row.classList.toggle('active', idx === selectedEvidenceIdx);
+    });
+}
+
+function applyEvidenceSelection(idx, ev) {
+    var hasModifier = !!(ev && (ev.metaKey || ev.ctrlKey));
+    var isRangeSelection = !!(ev && ev.shiftKey);
+
+    if (isRangeSelection && evidenceSelectionAnchorIdx >= 0) {
+        var start = Math.min(evidenceSelectionAnchorIdx, idx);
+        var end = Math.max(evidenceSelectionAnchorIdx, idx);
+        var range = [];
+        for (var i = start; i <= end; i += 1) {
+            range.push(i);
+        }
+        evidenceSelectedIdxs = range;
+    } else if (hasModifier) {
+        var next = evidenceSelectedIdxs.slice();
+        var existingPos = next.indexOf(idx);
+        if (existingPos >= 0) {
+            next.splice(existingPos, 1);
+        } else {
+            next.push(idx);
+        }
+        if (next.length === 0) {
+            next.push(idx);
+        }
+        evidenceSelectedIdxs = next.sort(function(a, b) { return a - b; });
+        evidenceSelectionAnchorIdx = idx;
+    } else {
+        evidenceSelectedIdxs = [idx];
+        evidenceSelectionAnchorIdx = idx;
+    }
+
+    if (evidenceSelectedIdxs.indexOf(idx) < 0) {
+        evidenceSelectedIdxs.push(idx);
+        evidenceSelectedIdxs.sort(function(a, b) { return a - b; });
+    }
+    selectedEvidenceIdx = idx;
+    updateEvidenceSelectionStyles();
+}
+
+function getEvidenceCopyTargets(preferredIdx) {
+    var selected = evidenceSelectedIdxs
+        .filter(function(i) { return Array.isArray(evidenceEntries) && !!evidenceEntries[i]; })
+        .sort(function(a, b) { return a - b; });
+    if (selected.length > 0) {
+        return selected;
+    }
+    if (typeof preferredIdx === 'number' && preferredIdx >= 0 && Array.isArray(evidenceEntries) && evidenceEntries[preferredIdx]) {
+        return [preferredIdx];
+    }
+    return [];
+}
+
+function selectEvidence(idx, ev) {
     if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
     var entry = evidenceEntries[idx];
-    selectedEvidenceIdx = idx;
-
-    document.querySelectorAll('.evidence-row').forEach(function(row) {
-        row.classList.remove('active');
-    });
-    var activeRow = document.querySelector('.evidence-row[data-evidence-idx="' + idx + '"]');
-    if (activeRow) { activeRow.classList.add('active'); }
+    applyEvidenceSelection(idx, ev);
 
     var empty = document.getElementById('evidence-detail-empty');
     var content = document.getElementById('evidence-detail-content');
@@ -1970,9 +2521,15 @@ function selectEvidence(idx) {
 function copyEvidenceUrl(idx, ev) {
     if (ev) { ev.stopPropagation(); }
     if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    var targetIdxs = getEvidenceCopyTargets(idx);
+    var filenames = targetIdxs
+        .map(function(i) { return evidenceEntries[i] ? evidenceEntries[i].name : ''; })
+        .filter(function(name) { return typeof name === 'string' && name.length > 0; });
+    if (filenames.length === 0) { return; }
     vscode.postMessage({
         command: 'copyEvidenceUrl',
-        filename: evidenceEntries[idx].name,
+        filename: filenames[0],
+        filenames: filenames,
         idx: idx,
     });
 }
@@ -1980,10 +2537,43 @@ function copyEvidenceUrl(idx, ev) {
 function copyEvidenceContent(idx, ev) {
     if (ev) { ev.stopPropagation(); }
     if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    var targetIdxs = getEvidenceCopyTargets(idx);
+    var filenames = targetIdxs
+        .map(function(i) { return evidenceEntries[i] ? evidenceEntries[i].name : ''; })
+        .filter(function(name) { return typeof name === 'string' && name.length > 0; });
+    if (filenames.length === 0) { return; }
+    var contentsByFilename = {};
+    targetIdxs.forEach(function(i) {
+        if (!evidenceEntries[i]) { return; }
+        var name = evidenceEntries[i].name;
+        if (typeof name !== 'string' || !name) { return; }
+        if (typeof evidenceRawContentByIdx[i] === 'string' && evidenceRawContentByIdx[i].length > 0) {
+            contentsByFilename[name] = evidenceRawContentByIdx[i];
+        }
+    });
     vscode.postMessage({
         command: 'copyEvidenceContent',
-        filename: evidenceEntries[idx].name,
+        filename: filenames[0],
+        filenames: filenames,
         content: evidenceRawContentByIdx[idx] || '',
+        contentsByFilename: contentsByFilename,
+        idx: idx,
+    });
+}
+
+function removeEvidence(idx, ev) {
+    if (ev) { ev.stopPropagation(); }
+    if (!Array.isArray(evidenceEntries) || !evidenceEntries[idx]) { return; }
+    var targetIdxs = getEvidenceCopyTargets(idx);
+    var filenames = targetIdxs
+        .map(function(i) { return evidenceEntries[i] ? evidenceEntries[i].name : ''; })
+        .filter(function(name) { return typeof name === 'string' && name.length > 0; });
+    if (filenames.length === 0) { return; }
+
+    vscode.postMessage({
+        command: 'removeEvidence',
+        filename: filenames[0],
+        filenames: filenames,
         idx: idx,
     });
 }
@@ -2105,20 +2695,37 @@ function showEvidenceContextMenu(x, y, idx) {
 }
 
 function wireEvidenceRowContextMenu() {
-    var copyUrlBtn = document.getElementById('evidence-context-copy-url');
-    if (copyUrlBtn) {
-        copyUrlBtn.addEventListener('click', function() {
-            if (evidenceContextIdx >= 0) { copyEvidenceUrl(evidenceContextIdx); }
-            hideEvidenceContextMenu();
-        });
-    }
+    if (!evidenceContextMenuWired) {
+        var copyUrlBtn = document.getElementById('evidence-context-copy-url');
+        if (copyUrlBtn) {
+            copyUrlBtn.addEventListener('click', function() {
+                if (evidenceContextIdx >= 0) { copyEvidenceUrl(evidenceContextIdx); }
+                hideEvidenceContextMenu();
+            });
+        }
 
-    var copyContentBtn = document.getElementById('evidence-context-copy-content');
-    if (copyContentBtn) {
-        copyContentBtn.addEventListener('click', function() {
-            if (evidenceContextIdx >= 0) { copyEvidenceContent(evidenceContextIdx); }
+        var copyContentBtn = document.getElementById('evidence-context-copy-content');
+        if (copyContentBtn) {
+            copyContentBtn.addEventListener('click', function() {
+                if (evidenceContextIdx >= 0) { copyEvidenceContent(evidenceContextIdx); }
+                hideEvidenceContextMenu();
+            });
+        }
+        var removeBtn = document.getElementById('evidence-context-remove');
+        if (removeBtn) {
+            removeBtn.addEventListener('click', function() {
+                if (evidenceContextIdx >= 0) { removeEvidence(evidenceContextIdx); }
+                hideEvidenceContextMenu();
+            });
+        }
+
+        document.addEventListener('click', function() {
             hideEvidenceContextMenu();
         });
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') { hideEvidenceContextMenu(); }
+        });
+        evidenceContextMenuWired = true;
     }
 
     document.querySelectorAll('.evidence-row').forEach(function(row) {
@@ -2127,7 +2734,9 @@ function wireEvidenceRowContextMenu() {
             var idxStr = row.getAttribute('data-evidence-idx');
             var idx = idxStr ? parseInt(idxStr, 10) : -1;
             if (idx >= 0) {
-                selectEvidence(idx);
+                if (evidenceSelectedIdxs.indexOf(idx) < 0) {
+                    selectEvidence(idx);
+                }
                 showEvidenceContextMenu(event.clientX, event.clientY, idx);
             }
         });
@@ -2136,17 +2745,11 @@ function wireEvidenceRowContextMenu() {
                 event.preventDefault();
                 var idxStr = row.getAttribute('data-evidence-idx');
                 var idx = idxStr ? parseInt(idxStr, 10) : -1;
-                if (idx >= 0) { selectEvidence(idx); }
+                if (idx >= 0) { selectEvidence(idx, event); }
             }
         });
     });
 
-    document.addEventListener('click', function() {
-        hideEvidenceContextMenu();
-    });
-    document.addEventListener('keydown', function(event) {
-        if (event.key === 'Escape') { hideEvidenceContextMenu(); }
-    });
 }
 
 function flashEvidenceCopyButton(idx) {
@@ -2214,6 +2817,33 @@ window.addEventListener('message', function(event) {
             return;
         }
         console.error('Evidence copy failed:', msg.kind);
+    }
+
+    if (msg.command === 'removeEvidenceResult') {
+        if (msg.ok) {
+            applyEvidenceRemoval(msg.removed);
+            return;
+        }
+        if (!msg.ok && !msg.cancelled) {
+            console.error('Evidence remove failed');
+        }
+    }
+
+    if (msg.command === 'evidenceRemovalPending') {
+        setEvidenceRemovalPending(!!msg.pending, msg.filenames || []);
+    }
+
+    if (msg.command === 'projectMetaUpdated') {
+        updateProjectMeta(msg.project || null, msg.projectPath || '', msg.repoUrl || '');
+    }
+
+    if (msg.command === 'planTitleUpdated') {
+        var titleText = typeof msg.title === 'string' ? msg.title.trim() : '';
+        var titleEl = document.getElementById('plan-title-text');
+        if (titleEl && titleText) {
+            titleEl.textContent = titleText;
+            titleEl.setAttribute('title', 'Click to rename plan');
+        }
     }
 });
 
