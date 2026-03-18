@@ -429,12 +429,12 @@ export class HttpMcpClient {
         const identifiers = this.planIdentifierCandidates(trimmed);
         let lastError: unknown;
 
-        // Try riotplan_idea kill first (preferred).
+        // Try riotplan_plan delete first (permanently removes the .plan file).
         for (const id of identifiers) {
             try {
                 const result = await this.sendRequest('tools/call', {
-                    name: 'riotplan_idea',
-                    arguments: { action: 'kill', planId: id, reason: 'Deleted via RiotPlan VS Code extension' },
+                    name: 'riotplan_plan',
+                    arguments: { action: 'delete', planId: id, confirm: true },
                 });
                 const toolError = getToolErrorText(result);
                 if (toolError) {
@@ -443,6 +443,23 @@ export class HttpMcpClient {
                 return result;
             } catch (error) {
                 lastError = error;
+            }
+        }
+
+        // Fallback: try the standalone riotplan_delete_plan tool.
+        for (const id of identifiers) {
+            try {
+                const result = await this.sendRequest('tools/call', {
+                    name: 'riotplan_delete_plan',
+                    arguments: { planId: id, confirm: true },
+                });
+                const toolError = getToolErrorText(result);
+                if (toolError) {
+                    throw new Error(toolError);
+                }
+                return result;
+            } catch {
+                // Try next candidate.
             }
         }
 
