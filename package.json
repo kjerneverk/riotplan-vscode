@@ -388,7 +388,7 @@
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
     "lint": "eslint src",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "coverage": "vitest run --coverage",
     "precommit": "npm run build && npm run lint && npm run coverage",
     "prepublishOnly": "npm run clean && npm run build",
