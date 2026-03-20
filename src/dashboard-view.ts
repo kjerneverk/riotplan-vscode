@@ -31,10 +31,13 @@ interface PlanSummary {
     lastUpdated?: string;
     category?: PlanCategory;
     project?: { id?: string; name?: string };
+    serverId?: string;
+    serverName?: string;
 }
 
 interface DashboardFilterState {
     projectFilter?: string;
+    serverFilterId?: string;
     statuses: PlanCategory[];
     sortOrder: PlanSortOrder;
 }
@@ -50,6 +53,7 @@ export class DashboardViewProvider {
     private _filters: DashboardFilterState = {
         statuses: ['active', 'done', 'hold'],
         sortOrder: 'name-asc',
+        serverFilterId: undefined,
     };
 
     constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -127,6 +131,7 @@ export class DashboardViewProvider {
     setFilters(next: DashboardFilterState): void {
         this._filters = {
             projectFilter: next.projectFilter?.trim().toLowerCase() || undefined,
+            serverFilterId: next.serverFilterId?.trim() || undefined,
             statuses: next.statuses.length > 0 ? [...next.statuses] : ['active', 'done', 'hold'],
             sortOrder: next.sortOrder,
         };
@@ -216,8 +221,11 @@ export class DashboardViewProvider {
                 lastUpdated: p.lastUpdated || p.updatedAt || p.createdAt,
                 category: getPlanCategory(p),
                 project: p.project,
+                serverId: typeof p.serverId === 'string' ? p.serverId : undefined,
+                serverName: typeof p.serverName === 'string' ? p.serverName : undefined,
             }))
                 .filter((plan: PlanSummary) => this._matchesProjectFilter(plan))
+                .filter((plan: PlanSummary) => this._matchesServerFilter(plan))
                 .filter((plan: PlanSummary) => this._filters.statuses.includes(plan.category || 'active'));
 
             const sorted = [...plans].sort((a, b) => this._comparePlans(a, b));
@@ -247,11 +255,12 @@ export class DashboardViewProvider {
                 break;
 
             case 'filter':
-                await vscode.commands.executeCommand('riotplan.filterPlansByProject');
+                await vscode.commands.executeCommand('riotplan.openPlanFiltersMenu');
                 break;
 
-            case 'filter-status':
-                await vscode.commands.executeCommand('riotplan.filterPlansByStatus');
+            case 'sync-context-catalog':
+                await vscode.commands.executeCommand('riotplan.syncContextCatalog');
+                await this._refreshData();
                 break;
         }
     }
@@ -267,6 +276,13 @@ export class DashboardViewProvider {
         const projectId = String(plan.project?.id || '').toLowerCase();
         const projectName = String(plan.project?.name || '').toLowerCase();
         return projectId.includes(needle) || projectName.includes(needle);
+    }
+
+    private _matchesServerFilter(plan: PlanSummary): boolean {
+        if (!this._filters.serverFilterId) {
+            return true;
+        }
+        return String(plan.serverId || '') === this._filters.serverFilterId;
     }
 
     private _comparePlans(left: PlanSummary, right: PlanSummary): number {
@@ -317,7 +333,7 @@ export class DashboardViewProvider {
       padding: 20px 28px;
     }
 
-    #app { max-width: 1200px; }
+    #app { max-width: 1400px; width: 100%; }
 
     .dashboard-header {
       display: flex;
@@ -398,10 +414,17 @@ export class DashboardViewProvider {
     }
 
     .plans-table {
+      table-layout: fixed;
       width: 100%;
       border-collapse: collapse;
       font-size: 13px;
     }
+
+    .plans-table col.col-plan { width: 30%; }
+    .plans-table col.col-server { width: 18%; }
+    .plans-table col.col-stage { width: 14%; }
+    .plans-table col.col-progress { width: 22%; }
+    .plans-table col.col-updated { width: 16%; }
 
     .plans-table th {
       text-align: left;
@@ -412,11 +435,32 @@ export class DashboardViewProvider {
       font-size: 11px;
       text-transform: uppercase;
       letter-spacing: 0.5px;
+      vertical-align: bottom;
     }
 
     .plans-table td {
       padding: 10px;
       border-bottom: 1px solid var(--vscode-widget-border, rgba(128,128,128,0.2));
+      vertical-align: middle;
+    }
+
+    .plans-table .cell-plan {
+      overflow: hidden;
+      min-width: 0;
+    }
+
+    .plans-table .cell-plan .plan-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .plans-table .cell-server {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--vscode-descriptionForeground);
+      font-size: 12px;
     }
 
     .plan-row {
@@ -503,8 +547,8 @@ export class DashboardViewProvider {
         <span class="total-badge" id="total-count">0 plans</span>
       </div>
       <div class="header-actions">
-        <button class="btn btn-secondary" id="filter-btn" title="Filter by project">⛃ Filter</button>
-        <button class="btn btn-secondary" id="filter-status-btn" title="Filter by status">☰ Status</button>
+        <button class="btn btn-secondary" id="filter-btn" title="Filter by project, status, or server">⛃ Filter</button>
+        <button class="btn btn-secondary" id="sync-context-btn" title="Sync context projects across MCP servers">⟳ Context</button>
         <button class="btn btn-secondary" id="refresh-btn" title="Refresh data">↺ Refresh</button>
         <button class="btn" id="create-btn" title="Create a new plan">+ New Plan</button>
       </div>
@@ -521,11 +565,11 @@ export class DashboardViewProvider {
     document.getElementById('refresh-btn').addEventListener('click', () => {
       vscode.postMessage({ type: 'refresh' });
     });
+    document.getElementById('sync-context-btn').addEventListener('click', () => {
+      vscode.postMessage({ type: 'sync-context-catalog' });
+    });
     document.getElementById('filter-btn').addEventListener('click', () => {
       vscode.postMessage({ type: 'filter' });
-    });
-    document.getElementById('filter-status-btn').addEventListener('click', () => {
-      vscode.postMessage({ type: 'filter-status' });
     });
 
     document.getElementById('create-btn').addEventListener('click', () => {
@@ -587,7 +631,10 @@ export class DashboardViewProvider {
         html += '</div>';
 
         html += '<table class="plans-table">';
-        html += '<thead><tr><th>Plan</th><th>Stage</th><th>Progress</th><th>Updated</th></tr></thead>';
+        html += '<colgroup>';
+        html += '<col class="col-plan" /><col class="col-server" /><col class="col-stage" /><col class="col-progress" /><col class="col-updated" />';
+        html += '</colgroup>';
+        html += '<thead><tr><th class="cell-plan">Plan</th><th class="cell-server">Server</th><th>Stage</th><th>Progress</th><th>Updated</th></tr></thead>';
         html += '<tbody>';
 
         for (const plan of plans) {
@@ -596,6 +643,9 @@ export class DashboardViewProvider {
           const normalizedStage = String(plan.stage || '').toLowerCase();
           const progressClass = 'progress-' + normalizedStage;
           const stageColor = STAGE_COLORS[normalizedStage] || '#9e9e9e';
+          const serverLabel = plan.serverName && String(plan.serverName).trim()
+            ? String(plan.serverName).trim()
+            : '—';
 
           html += '<tr class="plan-row"';
           if (planRef) {
@@ -603,9 +653,11 @@ export class DashboardViewProvider {
           }
           html += '>';
 
-          html += '<td>';
+          html += '<td class="cell-plan">';
           html += '<div class="plan-name">' + escapeHtml(plan.name) + '</div>';
           html += '</td>';
+
+          html += '<td class="cell-server" title="' + escapeAttr(serverLabel) + '">' + escapeHtml(serverLabel) + '</td>';
 
           html += '<td><span class="stage-pill" style="background:' + escapeAttr(stageColor + '33') + ';border:1px solid ' + escapeAttr(stageColor + '80') + ';">' + escapeHtml(plan.stage || 'unknown') + '</span></td>';
 

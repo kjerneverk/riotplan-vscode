@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import { HttpMcpClient, isUnauthorizedError } from './mcp-client';
+import { fromServerScopedRef } from './multiServer/types';
 
 interface ContextProject {
     id?: string;
     name?: string;
     active?: boolean;
+    serverName?: string;
     [key: string]: unknown;
 }
 
@@ -12,10 +14,24 @@ export class ProjectItem extends vscode.TreeItem {
     constructor(public readonly project: ContextProject) {
         const label = String(project.name || project.id || 'Unnamed project');
         super(label, vscode.TreeItemCollapsibleState.None);
-        const id = String(project.id || '').trim();
+        const rawId = String(project.id || '').trim();
+        const scoped = rawId ? fromServerScopedRef(rawId) : undefined;
+        const displayId = scoped?.value ?? rawId;
+        const serverName = String(project.serverName || '').trim();
         const status = project.active === false ? 'Inactive' : 'Active';
-        this.description = id && id !== label ? `${status} · ${id}` : status;
-        this.tooltip = id ? `${label} (${id})` : label;
+        if (displayId && displayId !== label) {
+            this.description = serverName
+                ? `${serverName} · ${status} · ${displayId}`
+                : `${status} · ${displayId}`;
+        } else {
+            this.description = serverName ? `${serverName} · ${status}` : status;
+        }
+        this.tooltip =
+            serverName && displayId
+                ? `${label} — ${serverName} (${displayId})`
+                : displayId
+                    ? `${label} (${displayId})`
+                    : label;
         this.contextValue = 'project';
         this.iconPath =
             project.active === false

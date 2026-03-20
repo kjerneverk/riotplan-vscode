@@ -1,6 +1,17 @@
 import { HttpMcpClient } from '../mcp-client';
 import { MultiServerConnectionManager } from './connectionManager';
-import { toServerScopedRef } from './types';
+import {
+    isCatalogProjectUuid,
+    pickWinningCatalogEntity,
+} from './contextCatalogSync';
+import { fromServerScopedRef, toServerScopedRef } from './types';
+
+export interface MultiServerAggregatorOptions {
+    /** One tree row per global catalog UUID (replicated context projects). */
+    dedupeContextProjectsByCatalogId?: boolean;
+    /** Used for scoped plan-like ids in the UI when deduping; falls back to first connected profile. */
+    preferredServerIdForContextUi?: string;
+}
 
 interface ServerPlanShape {
     [key: string]: unknown;
@@ -40,7 +51,14 @@ function resolvePlanRef(plan: ServerPlanShape): string | undefined {
 }
 
 export class MultiServerAggregator {
-    constructor(private readonly manager: MultiServerConnectionManager) {}
+    private readonly options: MultiServerAggregatorOptions;
+
+    constructor(
+        private readonly manager: MultiServerConnectionManager,
+        options?: MultiServerAggregatorOptions
+    ) {
+        this.options = options || {};
+    }
 
     async listPlans(filter?: 'all' | 'active' | 'done' | 'hold'): Promise<any> {
         const merged: any[] = [];
@@ -93,7 +111,61 @@ export class MultiServerAggregator {
                 });
             }
         }));
-        return merged;
+
+        if (!this.options.dedupeContextProjectsByCatalogId || merged.length === 0) {
+            return merged;
+        }
+
+        const profileById = new Map(this.manager.getProfiles().map((p) => [p.id, p]));
+        const statuses = new Map(this.manager.getStatuses().map((s) => [s.serverId, s]));
+
+        const refProfile = (() => {
+            const preferred = this.options.preferredServerIdForContextUi;
+            if (preferred && profileById.has(preferred) && statuses.get(preferred)?.state === 'connected') {
+                return profileById.get(preferred)!;
+            }
+            for (const p of this.manager.getProfiles()) {
+                if (!p.enabled || statuses.get(p.id)?.state !== 'connected') {
+                    continue;
+                }
+                return p;
+            }
+            return this.manager.getProfiles().find((p) => p.enabled) || profileById.values().next().value;
+        })();
+
+        if (!refProfile) {
+            return merged;
+        }
+
+        const passthrough: any[] = [];
+        const byUuid = new Map<string, any>();
+        for (const row of merged) {
+            const scoped = fromServerScopedRef(String(row.id || ''));
+            const uuid = scoped?.value;
+            if (!uuid || !isCatalogProjectUuid(uuid)) {
+                passthrough.push(row);
+                continue;
+            }
+            const prev = byUuid.get(uuid);
+            if (!prev) {
+                byUuid.set(uuid, row);
+                continue;
+            }
+            byUuid.set(uuid, pickWinningCatalogEntity(prev, row));
+        }
+
+        const reScoped = [...byUuid.values()].map((row) => {
+            const scoped = fromServerScopedRef(String(row.id || ''));
+            const uuid = scoped?.value || '';
+            return {
+                ...row,
+                serverId: refProfile.id,
+                serverName: refProfile.name,
+                id: toServerScopedRef(refProfile.id, uuid),
+            };
+        });
+
+        return [...passthrough, ...reScoped];
     }
 
     getClientForServer(serverId: string): HttpMcpClient | undefined {

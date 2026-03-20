@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { HttpMcpClient } from './mcp-client';
+import { fromServerScopedRef } from './multiServer/types';
 
 interface ProjectLike {
     id?: string;
@@ -142,8 +143,15 @@ export class ProjectDetailPanel {
     private static readonly viewType = 'riotplan.projectDetail';
     private static readonly panels = new Map<string, ProjectDetailPanel>();
 
-    static createOrShow(projectId: string, client: HttpMcpClient, initialProject?: ProjectLike): void {
-        const existing = this.panels.get(projectId);
+    /**
+     * @param scopedOrRawProjectId Merged multi-server id (`profileId::apiId`) or plain id from a single server
+     */
+    static createOrShow(scopedOrRawProjectId: string, client: HttpMcpClient, initialProject?: ProjectLike): void {
+        const panelKey = scopedOrRawProjectId.trim();
+        const scoped = fromServerScopedRef(panelKey);
+        const apiProjectId = scoped?.value ?? panelKey;
+
+        const existing = this.panels.get(panelKey);
         if (existing) {
             existing.updateClient(client);
             existing.panel.reveal(vscode.ViewColumn.Beside);
@@ -153,7 +161,7 @@ export class ProjectDetailPanel {
 
         const panel = vscode.window.createWebviewPanel(
             this.viewType,
-            initialProject?.name || projectId,
+            initialProject?.name || apiProjectId,
             vscode.ViewColumn.Beside,
             {
                 enableScripts: true,
@@ -161,24 +169,42 @@ export class ProjectDetailPanel {
             }
         );
 
-        const instance = new ProjectDetailPanel(panel, projectId, client, initialProject);
-        this.panels.set(projectId, instance);
+        const instance = new ProjectDetailPanel(
+            panel,
+            panelKey,
+            apiProjectId,
+            scoped?.serverId,
+            client,
+            initialProject
+        );
+        this.panels.set(panelKey, instance);
     }
 
-    static updateClientForAll(client: HttpMcpClient): void {
+    static updateClientForAll(
+        fallbackClient: HttpMcpClient,
+        getClientForServer?: (serverId: string) => HttpMcpClient | undefined
+    ): void {
         for (const panel of this.panels.values()) {
-            panel.updateClient(client);
+            const next =
+                panel.sourceServerId && getClientForServer
+                    ? getClientForServer(panel.sourceServerId) ?? fallbackClient
+                    : fallbackClient;
+            panel.updateClient(next);
         }
     }
 
     private constructor(
         private readonly panel: vscode.WebviewPanel,
-        private readonly projectId: string,
+        /** Stable key for the panel map (may include `serverId::` prefix) */
+        private readonly panelKey: string,
+        /** Id passed to MCP getContextProject / plan matching */
+        private readonly apiProjectId: string,
+        readonly sourceServerId: string | undefined,
         private client: HttpMcpClient,
         private initialProject?: ProjectLike
     ) {
         this.panel.onDidDispose(() => {
-            ProjectDetailPanel.panels.delete(this.projectId);
+            ProjectDetailPanel.panels.delete(this.panelKey);
         });
         this.panel.webview.onDidReceiveMessage(async (message: { type?: string; planRef?: string }) => {
             if (message.type === 'refresh') {
@@ -201,7 +227,7 @@ export class ProjectDetailPanel {
         try {
             const project = await this.loadProject();
             const plans = await this.loadRelatedPlans(project);
-            const displayName = project?.name || project?.id || this.projectId;
+            const displayName = project?.name || project?.id || this.apiProjectId;
             this.panel.title = `Project: ${displayName}`;
             this.panel.webview.html = this.getHtml(project, plans);
         } catch (error) {
@@ -211,12 +237,12 @@ export class ProjectDetailPanel {
     }
 
     private async loadProject(): Promise<ProjectLike | null> {
-        const project = await this.client.getContextProject(this.projectId);
+        const project = await this.client.getContextProject(this.apiProjectId);
         if (project) {
             this.initialProject = project;
             return project;
         }
-        return this.initialProject || { id: this.projectId, name: this.projectId };
+        return this.initialProject || { id: this.apiProjectId, name: this.apiProjectId };
     }
 
     private async loadRelatedPlans(project: ProjectLike | null): Promise<PlanLike[]> {
@@ -228,7 +254,7 @@ export class ProjectDetailPanel {
         const parsed = JSON.parse(content.text);
         const plans = Array.isArray(parsed?.plans) ? parsed.plans : [];
         const filtered = plans.filter((plan: PlanLike) => {
-            return projectMatchesPlan(project, this.projectId, plan);
+            return projectMatchesPlan(project, this.apiProjectId, plan);
         });
         return filtered.sort((a: PlanLike, b: PlanLike) => {
             const aName = String(a.name || a.code || a.id || a.uuid || '').toLowerCase();
@@ -258,8 +284,8 @@ export class ProjectDetailPanel {
     }
 
     private getHtml(project: ProjectLike | null, plans: PlanLike[]): string {
-        const projectName = this.esc(project?.name || project?.id || this.projectId);
-        const projectId = this.esc(project?.id || this.projectId);
+        const projectName = this.esc(project?.name || project?.id || this.apiProjectId);
+        const projectId = this.esc(project?.id || this.apiProjectId);
         const active = project?.active === false ? 'Inactive' : 'Active';
         const repoUrl = typeof project?.repo?.url === 'string' ? project.repo.url : '';
         const repoLabel = repoUrl ? this.esc(repoUrl) : '—';

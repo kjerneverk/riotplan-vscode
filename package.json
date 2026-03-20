@@ -2,7 +2,7 @@
   "name": "riotplan-vscode",
   "displayName": "RiotPlan",
   "description": "Plan management for RiotPlan HTTP server",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "publisher": "kjerneverk",
   "engines": {
     "vscode": "^1.60.0"
@@ -20,7 +20,8 @@
     "onCommand:riotplan.showServerConnectionDetails",
     "onCommand:riotplan.removeServerConnection",
     "onCommand:riotplan.configureApiKey",
-    "onCommand:riotplan.clearApiKey"
+    "onCommand:riotplan.clearApiKey",
+    "onCommand:riotplan.syncContextCatalog"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -92,6 +93,12 @@
           "default": false,
           "description": "Enable verbose request logging for token/auth header debugging (redacted values).",
           "markdownDescription": "When enabled, logs each RiotPlan HTTP/SSE request with redacted auth-header presence to the `RiotPlan Auth Debug` output channel."
+        },
+        "riotplan.contextCatalogReplication": {
+          "type": "boolean",
+          "default": true,
+          "description": "Replicate context project entities across all connected MCP servers (UUID catalog, merge on connect, upsert all-to-all).",
+          "markdownDescription": "When enabled, new context projects created in the extension are **upserted to every connected server** (UUID from `crypto.randomUUID()`, stamped with `catalogUpdatedAt` / `catalogRevision`). On connect / manual sync, the extension merges by **newer `catalogUpdatedAt` first**, then higher `catalogRevision`, and upserts the merged catalog everywhere. Edits made only via MCP on one server are picked up on the next merge/sync, not pushed live by the extension (the project detail view is read-only). Disable for fully independent servers."
         }
       }
     },
@@ -127,9 +134,14 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "riotplan.openPlanFiltersMenu",
+        "title": "Filter Plans…",
+        "icon": "$(filter)"
+      },
+      {
         "command": "riotplan.filterPlansByProject",
         "title": "Filter by Project",
-        "icon": "$(filter)"
+        "icon": "$(folder)"
       },
       {
         "command": "riotplan.filterPlansByStatus",
@@ -229,6 +241,12 @@
         "icon": "$(plug)"
       },
       {
+        "command": "riotplan.syncContextCatalog",
+        "title": "Sync Context",
+        "icon": "$(repo-sync)",
+        "category": "RiotPlan"
+      },
+      {
         "command": "riotplan.openDashboard",
         "title": "Open Dashboard",
         "icon": "$(dashboard)"
@@ -272,17 +290,22 @@
           "group": "navigation"
         },
         {
+          "command": "riotplan.syncContextCatalog",
+          "when": "view == riotplan-projects && config.riotplan.contextCatalogReplication",
+          "group": "navigation"
+        },
+        {
           "command": "riotplan.refreshPlans",
           "when": "view == riotplan-plans",
           "group": "navigation"
         },
         {
-          "command": "riotplan.filterPlansByProject",
-          "when": "view == riotplan-plans",
+          "command": "riotplan.syncContextCatalog",
+          "when": "view == riotplan-plans && config.riotplan.contextCatalogReplication",
           "group": "navigation"
         },
         {
-          "command": "riotplan.filterPlansByStatus",
+          "command": "riotplan.openPlanFiltersMenu",
           "when": "view == riotplan-plans",
           "group": "navigation"
         },
@@ -377,6 +400,11 @@
           "command": "riotplan.openProjectEntity",
           "when": "view == riotplan-projects && viewItem == project",
           "group": "navigation@1"
+        },
+        {
+          "command": "riotplan.syncContextCatalog",
+          "when": "view == riotplan-projects && viewItem == project && config.riotplan.contextCatalogReplication",
+          "group": "navigation@2"
         }
       ]
     }
@@ -388,7 +416,7 @@
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
     "lint": "eslint src",
-    "test": "vitest run",
+    "test": "vitest run --coverage",
     "coverage": "vitest run --coverage",
     "precommit": "npm run build && npm run lint && npm run coverage",
     "prepublishOnly": "npm run clean && npm run build",
@@ -417,5 +445,8 @@
   "author": "Tim O'Brien <tobrien@discursive.com>",
   "dependencies": {
     "https-proxy-agent": "^7.0.6"
+  },
+  "publishConfig": {
+    "tag": "dev"
   }
 }

@@ -68,6 +68,8 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
     readonly dragMimeTypes = [TREE_MIME];
     readonly dropMimeTypes = [TREE_MIME];
     private projectFilter: string | undefined;
+    /** When set, only plans from this MCP server profile id are shown. */
+    private serverFilterId: string | undefined;
     private visibleCategories: Set<PlanCategory> = new Set(['active', 'done', 'hold']);
     private sortOrder: PlanSortOrder = 'name-asc';
 
@@ -83,6 +85,12 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
 
     setProjectFilter(value: string | undefined): void {
         this.projectFilter = value?.trim().toLowerCase() || undefined;
+        this.refresh();
+    }
+
+    setServerFilter(serverId: string | undefined): void {
+        const trimmed = serverId?.trim();
+        this.serverFilterId = trimmed || undefined;
         this.refresh();
     }
 
@@ -102,6 +110,10 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
 
     getProjectFilter(): string | undefined {
         return this.projectFilter;
+    }
+
+    getServerFilter(): string | undefined {
+        return this.serverFilterId;
     }
 
     getStatusFilter(): PlanCategory[] {
@@ -314,6 +326,7 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         return plans
             .filter((plan: any) => this.getPlanCategory(plan) === category)
             .filter((plan: any) => this.matchesProjectFilter(plan))
+            .filter((plan: any) => this.matchesServerFilter(plan))
             .sort((left: any, right: any) => this.comparePlans(left, right));
     }
 
@@ -327,6 +340,13 @@ export class PlansTreeProvider implements vscode.TreeDataProvider<PlanItem>, vsc
         const projectId = String(plan?.project?.id || '').toLowerCase();
         const projectName = String(plan?.project?.name || '').toLowerCase();
         return projectId.includes(this.projectFilter) || projectName.includes(this.projectFilter);
+    }
+
+    private matchesServerFilter(plan: any): boolean {
+        if (!this.serverFilterId) {
+            return true;
+        }
+        return String(plan?.serverId || '') === this.serverFilterId;
     }
 
     private comparePlans(left: any, right: any): number {
