@@ -23,7 +23,8 @@ import { ProjectsTreeProvider } from './projects-provider';
 import { MultiServerConnectionManager } from './multiServer/connectionManager';
 import { ServerProfilesStore } from './multiServer/profilesStore';
 import { sanitizeToken, tokenStorageKey } from './multiServer/auth';
-import { MultiServerAggregator } from './multiServer/aggregator';
+import { MultiServerAggregator, type MultiServerAggregatorOptions } from './multiServer/aggregator';
+import { ContextCatalogSyncEngine, stampNewCatalogMetadata } from './multiServer/contextCatalogSync';
 import { fromServerScopedRef } from './multiServer/types';
 
 interface ContextProject {
@@ -64,6 +65,7 @@ let mcpClient: HttpMcpClient;
 let connectionManager: MultiServerConnectionManager;
 let profilesStore: ServerProfilesStore;
 let aggregator: MultiServerAggregator;
+let contextCatalogSync: ContextCatalogSyncEngine | undefined;
 let plansProvider: PlansTreeProvider;
 let projectsProvider: ProjectsTreeProvider;
 let statusProvider: StatusTreeProvider;
@@ -74,6 +76,66 @@ let currentProxyBypass = false;
 const PLAN_LIST_AUTO_REFRESH_MS = 5 * 60 * 1000;
 const PLAN_DETAIL_AUTO_REFRESH_MS = 2 * 60 * 1000;
 const AUTH_DEBUG_CHANNEL_NAME = 'RiotPlan Auth Debug';
+/** Quick pick sentinel: run context catalog sync instead of setting a filter. */
+const PROJECT_FILTER_SYNC_SENTINEL = '__riotplan_sync_context__';
+const CONTEXT_CATALOG_MUTATION_SYNC_DEBOUNCE_MS = 450;
+
+let contextCatalogMutationDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+
+function isContextCatalogReplicationEnabled(): boolean {
+    return vscode.workspace.getConfiguration('riotplan').get<boolean>('contextCatalogReplication', true);
+}
+
+function getMultiServerAggregatorOptions(): MultiServerAggregatorOptions {
+    return {
+        dedupeContextProjectsByCatalogId: isContextCatalogReplicationEnabled(),
+        preferredServerIdForContextUi: connectionManager.getActiveServerId(),
+    };
+}
+
+function refreshAggregatorAndClients(): void {
+    aggregator = new MultiServerAggregator(connectionManager, getMultiServerAggregatorOptions());
+    contextCatalogSync = new ContextCatalogSyncEngine(connectionManager);
+    plansProvider.updateClient(aggregator as any);
+    projectsProvider.updateClient(aggregator as any);
+    dashboardProvider.setClient(aggregator as any);
+}
+
+async function runContextCatalogFullSyncAfterConnections(silent: boolean): Promise<void> {
+    if (!isContextCatalogReplicationEnabled() || !contextCatalogSync) {
+        return;
+    }
+    try {
+        const r = await contextCatalogSync.runFullSync();
+        if (r.errors.length > 0) {
+            console.error('RiotPlan context catalog sync:', r.errors);
+            if (!silent) {
+                vscode.window.showWarningMessage(
+                    `Context catalog sync finished with ${r.upsertsFailed} failed operation(s). Check the developer console for details.`
+                );
+            }
+        }
+        plansProvider.refresh();
+        projectsProvider.refresh();
+        void dashboardProvider.refreshData().catch(() => undefined);
+    } catch (error) {
+        console.error('RiotPlan context catalog sync failed:', error);
+    }
+}
+
+/** After local context-project creates / upserts, re-merge and push (debounced). */
+function scheduleContextCatalogSyncAfterMutation(): void {
+    if (!isContextCatalogReplicationEnabled() || !contextCatalogSync) {
+        return;
+    }
+    if (contextCatalogMutationDebounceTimer) {
+        clearTimeout(contextCatalogMutationDebounceTimer);
+    }
+    contextCatalogMutationDebounceTimer = setTimeout(() => {
+        contextCatalogMutationDebounceTimer = undefined;
+        void runContextCatalogFullSyncAfterConnections(true);
+    }, CONTEXT_CATALOG_MUTATION_SYNC_DEBOUNCE_MS);
+}
 
 export async function activate(context: vscode.ExtensionContext) {
     console.log('RiotPlan extension is now active');
@@ -85,7 +147,8 @@ export async function activate(context: vscode.ExtensionContext) {
     currentServerUrl = getLegacyServerUrl() || 'http://127.0.0.1:3002';
     currentProxyBypass = getConfiguredProxyBypass();
     mcpClient = new HttpMcpClient(currentServerUrl, undefined, currentProxyBypass);
-    aggregator = new MultiServerAggregator(connectionManager);
+    aggregator = new MultiServerAggregator(connectionManager, getMultiServerAggregatorOptions());
+    contextCatalogSync = new ContextCatalogSyncEngine(connectionManager);
     plansProvider = new PlansTreeProvider(aggregator as any);
     projectsProvider = new ProjectsTreeProvider(aggregator as any);
     statusProvider = new StatusTreeProvider(mcpClient, currentServerUrl);
@@ -97,6 +160,7 @@ export async function activate(context: vscode.ExtensionContext) {
     function syncDashboardFilters(): void {
         dashboardProvider.setFilters({
             projectFilter: plansProvider.getProjectFilter(),
+            serverFilterId: plansProvider.getServerFilter(),
             statuses: plansProvider.getStatusFilter(),
             sortOrder: plansProvider.getSortOrder(),
         });
@@ -147,12 +211,12 @@ export async function activate(context: vscode.ExtensionContext) {
         currentProxyBypass = proxyBypass ?? currentProxyBypass;
         mcpClient = new HttpMcpClient(newUrl, undefined, currentProxyBypass);
         applyAuthDebugLogging();
-        plansProvider.updateClient(aggregator as any);
+        refreshAggregatorAndClients();
         statusProvider.updateClient(mcpClient, newUrl);
         dashboardProvider.setClient(aggregator as any);
         projectsProvider.updateClient(aggregator as any);
         PlanDetailPanel.updateClientForAll(mcpClient);
-        ProjectDetailPanel.updateClientForAll(mcpClient);
+        ProjectDetailPanel.updateClientForAll(mcpClient, (id) => aggregator.getClientForServer(id));
         syncDashboardFilters();
         plansProvider.refresh();
         projectsProvider.refresh();
@@ -172,7 +236,6 @@ export async function activate(context: vscode.ExtensionContext) {
             await hydrateProfileApiKeys(context, profiles);
             await connectionManager.connectAll();
             applyAuthDebugLogging();
-            aggregator = new MultiServerAggregator(connectionManager);
 
             let nextActiveServerId: string | undefined = configuredActiveServerId;
             if (!nextActiveServerId || !profiles.some((profile) => profile.id === nextActiveServerId && profile.enabled)) {
@@ -190,15 +253,14 @@ export async function activate(context: vscode.ExtensionContext) {
             }
             applyAuthDebugLogging();
 
-            plansProvider.updateClient(aggregator as any);
-            projectsProvider.updateClient(aggregator as any);
+            refreshAggregatorAndClients();
             statusProvider.updateClient(mcpClient, currentServerUrl);
-            dashboardProvider.setClient(aggregator as any);
             syncDashboardFilters();
             plansProvider.refresh();
             projectsProvider.refresh();
             await refreshServerStatuses();
             await checkConnection(currentServerUrl);
+            void runContextCatalogFullSyncAfterConnections(true);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             console.error('Failed to reload connections from profiles:', message);
@@ -287,8 +349,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         vscode.commands.registerCommand('riotplan.filterPlansByProject', async () => {
-            const projects = await mcpClient.listContextProjects(true).catch(() => []);
+            const projects = await aggregator.listContextProjects(true).catch(() => []);
             const quickPickItems: Array<vscode.QuickPickItem & { value?: string }> = [
+                {
+                    label: '$(repo-sync) Sync context across servers',
+                    value: PROJECT_FILTER_SYNC_SENTINEL,
+                    description: 'Merge context projects on every connected server',
+                },
                 {
                     label: '$(clear-all) Show all projects',
                     value: undefined,
@@ -299,17 +366,25 @@ export async function activate(context: vscode.ExtensionContext) {
                     value: UNASSIGNED_PROJECT_FILTER,
                     description: 'Plans with no assigned project',
                 },
-                ...sortedProjects(projects).map((project: ContextProject) => ({
-                    label: String(project.name || project.id || 'Unnamed project'),
-                    description: String(project.id || ''),
-                    value: String(project.id || project.name || ''),
-                })),
+                ...sortedProjects(projects).map((project: ContextProject) => {
+                    const rawId = String(project.id || '');
+                    const filterId = unscopedContextProjectId(rawId).toLowerCase();
+                    return {
+                        label: String(project.name || project.id || 'Unnamed project'),
+                        description: unscopedContextProjectId(rawId),
+                        value: filterId || String(project.name || '').toLowerCase(),
+                    };
+                }),
             ];
             const selected = await vscode.window.showQuickPick(quickPickItems, {
                 title: 'Filter plans by project',
                 placeHolder: 'Choose a project to filter by',
             });
             if (!selected) {
+                return;
+            }
+            if (selected.value === PROJECT_FILTER_SYNC_SENTINEL) {
+                await vscode.commands.executeCommand('riotplan.syncContextCatalog');
                 return;
             }
             plansProvider.setProjectFilter(selected.value);
@@ -333,6 +408,80 @@ export async function activate(context: vscode.ExtensionContext) {
                 return;
             }
             plansProvider.setStatusFilter(selected.map((entry) => entry.category));
+            syncDashboardFilters();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('riotplan.openPlanFiltersMenu', async () => {
+            type MenuPick = vscode.QuickPickItem & { filterAction: 'project' | 'status' | 'server' | 'sync-context' };
+            const menuItems: MenuPick[] = [
+                {
+                    label: '$(repo-sync) Sync context catalog',
+                    description: 'Merge context projects across all connected servers',
+                    filterAction: 'sync-context',
+                },
+                {
+                    label: '$(folder) Project',
+                    description: 'Limit plans to one context project',
+                    filterAction: 'project',
+                },
+                {
+                    label: '$(symbol-boolean) Status',
+                    description: 'Active, done, or hold',
+                    filterAction: 'status',
+                },
+                {
+                    label: '$(server-process) Server',
+                    description: 'Local vs remote MCP connection',
+                    filterAction: 'server',
+                },
+            ];
+            const choice = await vscode.window.showQuickPick(menuItems, {
+                title: 'Filter plans',
+                placeHolder: 'Choose what to filter by',
+            });
+            if (!choice || !('filterAction' in choice)) {
+                return;
+            }
+            if (choice.filterAction === 'sync-context') {
+                await vscode.commands.executeCommand('riotplan.syncContextCatalog');
+                return;
+            }
+            if (choice.filterAction === 'project') {
+                await vscode.commands.executeCommand('riotplan.filterPlansByProject');
+                return;
+            }
+            if (choice.filterAction === 'status') {
+                await vscode.commands.executeCommand('riotplan.filterPlansByStatus');
+                return;
+            }
+            type ServerPick = vscode.QuickPickItem & { clearAll?: boolean; serverId?: string };
+            const enabledProfiles = connectionManager.getProfiles().filter((profile) => profile.enabled);
+            const serverItems: ServerPick[] = [
+                {
+                    label: '$(clear-all) All servers',
+                    description: 'Show plans from every connected server',
+                    clearAll: true,
+                },
+                ...enabledProfiles.map((profile) => ({
+                    label: profile.name || profile.id,
+                    description: profile.url,
+                    serverId: profile.id,
+                })),
+            ];
+            const serverChoice = await vscode.window.showQuickPick(serverItems, {
+                title: 'Filter plans by server',
+                placeHolder: 'Choose a server profile',
+            });
+            if (!serverChoice) {
+                return;
+            }
+            if (serverChoice.clearAll) {
+                plansProvider.setServerFilter(undefined);
+            } else if (serverChoice.serverId) {
+                plansProvider.setServerFilter(serverChoice.serverId);
+            }
             syncDashboardFilters();
         })
     );
@@ -466,6 +615,42 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('riotplan.reconnect', async () => {
             await reloadConnectionsFromProfiles();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('riotplan.syncContextCatalog', async () => {
+            if (!isContextCatalogReplicationEnabled()) {
+                vscode.window.showInformationMessage(
+                    'Context catalog replication is disabled. Enable `riotplan.contextCatalogReplication` in settings.'
+                );
+                return;
+            }
+            if (!contextCatalogSync) {
+                return;
+            }
+            await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: 'Syncing context catalog across servers…',
+                },
+                async () => {
+                    const r = await contextCatalogSync!.runFullSync();
+                    if (r.errors.length > 0) {
+                        vscode.window.showWarningMessage(
+                            `Sync done: ${r.upsertsOk} ok, ${r.upsertsFailed} failed. See console for details.`
+                        );
+                        console.error('riotplan.syncContextCatalog errors:', r.errors);
+                    } else {
+                        vscode.window.showInformationMessage(
+                            `Context catalog in sync (${r.entityCount} project(s) on ${r.connectedServers} server(s)).`
+                        );
+                    }
+                    plansProvider.refresh();
+                    projectsProvider.refresh();
+                    void dashboardProvider.refreshData().catch(() => undefined);
+                }
+            );
         })
     );
 
@@ -741,22 +926,6 @@ export async function activate(context: vscode.ExtensionContext) {
         await profilesStore.saveProfiles(updatedProfiles);
         await context.secrets.delete(tokenStorageKey(selected.id));
         await reloadConnectionsFromProfiles();
-    }
-
-    function resolvePlanCodeCandidate(plan: PlanSelectionInput, scopedRef: string, downloadedFilename: string): string {
-        const fromLabel = typeof plan?.label === 'string' ? plan.label.trim() : '';
-        if (fromLabel) {
-            return sanitizePlanCode(fromLabel);
-        }
-        const fromName = typeof plan?.name === 'string' ? plan.name.trim() : '';
-        if (fromName) {
-            return sanitizePlanCode(fromName);
-        }
-        const fromRef = sanitizePlanCode(fromServerScopedRef(scopedRef)?.value || scopedRef);
-        if (fromRef) {
-            return fromRef;
-        }
-        return sanitizePlanCode(downloadedFilename.replace(/\.plan$/i, ''));
     }
 
     function findTargetPlanConflict(plans: any[], candidateCode: string): string | undefined {
@@ -1345,7 +1514,12 @@ export async function activate(context: vscode.ExtensionContext) {
                     continue;
                 }
                 opened.add(resolved.projectId);
-                ProjectDetailPanel.createOrShow(resolved.projectId, mcpClient, resolved.project);
+                const scopedProject = fromServerScopedRef(resolved.projectId);
+                const projectClient =
+                    scopedProject && aggregator.getClientForServer(scopedProject.serverId)
+                        ? aggregator.getClientForServer(scopedProject.serverId)!
+                        : mcpClient;
+                ProjectDetailPanel.createOrShow(resolved.projectId, projectClient, resolved.project);
             }
 
             if (opened.size === 0) {
@@ -1378,6 +1552,12 @@ export async function activate(context: vscode.ExtensionContext) {
             ) {
                 void reloadConnectionsFromProfiles();
             }
+            if (e.affectsConfiguration('riotplan.contextCatalogReplication')) {
+                refreshAggregatorAndClients();
+                void runContextCatalogFullSyncAfterConnections(false);
+                plansProvider.refresh();
+                projectsProvider.refresh();
+            }
             if (e.affectsConfiguration('riotplan.debugAuthLogging')) {
                 applyAuthDebugLogging();
             }
@@ -1394,7 +1574,7 @@ export async function activate(context: vscode.ExtensionContext) {
         await hydrateProfileApiKeys(context, profiles);
         await connectionManager.connectAll();
         applyAuthDebugLogging();
-        aggregator = new MultiServerAggregator(connectionManager);
+        refreshAggregatorAndClients();
 
         const activeClient = connectionManager.getActiveClient();
         if (activeClient) {
@@ -1403,15 +1583,13 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         applyAuthDebugLogging();
 
-        plansProvider.updateClient(aggregator as any);
-        projectsProvider.updateClient(aggregator as any);
         statusProvider.updateClient(mcpClient, currentServerUrl);
-        dashboardProvider.setClient(aggregator as any);
         syncDashboardFilters();
         plansProvider.refresh();
         projectsProvider.refresh();
         void refreshServerStatuses();
         void checkConnection(currentServerUrl);
+        void runContextCatalogFullSyncAfterConnections(true);
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         console.error('RiotPlan activation connection setup failed:', message);
@@ -1635,10 +1813,16 @@ async function maybeRemapTransferredPlan(planRef: string): Promise<void> {
         if (!projectNameInput || !projectNameInput.trim()) {
             return;
         }
-        const existingProjects = await resolved.client.listContextProjects(true).catch(() => []);
+        const existingProjects = await aggregator.listContextProjects(true).catch(() => []);
         const projectName = projectNameInput.trim();
         const projectId = makeProjectId(projectName, existingProjects);
-        await resolved.client.createContextProject(buildDefaultProjectEntity(projectId, projectName));
+        const newEntity = buildDefaultProjectEntity(projectId, projectName);
+        if (isContextCatalogReplicationEnabled() && contextCatalogSync) {
+            await contextCatalogSync.pushEntityToAllConnected(newEntity);
+            scheduleContextCatalogSyncAfterMutation();
+        } else {
+            await resolved.client.createContextProject(newEntity);
+        }
         await resolved.client.bindProject(resolved.planRef, {
             id: projectId,
             name: projectName,
@@ -1667,8 +1851,23 @@ function makeProjectId(name: string, existingProjects: ContextProject[]): string
     return randomUUID();
 }
 
+function unscopedContextProjectId(raw: string): string {
+    const trimmed = raw.trim();
+    const parsed = fromServerScopedRef(trimmed);
+    return parsed?.value ?? trimmed;
+}
+
+function normalizeContextProjectForBinding(project: ContextProject): ContextProject {
+    const id = String(project.id || '').trim();
+    if (!id) {
+        return project;
+    }
+    const bare = unscopedContextProjectId(id);
+    return bare === id ? project : { ...project, id: bare };
+}
+
 function buildDefaultProjectEntity(id: string, name: string): Record<string, unknown> {
-    return {
+    const entity: Record<string, unknown> = {
         id,
         name,
         type: 'project',
@@ -1681,6 +1880,8 @@ function buildDefaultProjectEntity(id: string, name: string): Record<string, unk
             filename_options: ['subject'],
         },
     };
+    stampNewCatalogMetadata(entity);
+    return entity;
 }
 
 async function createContextProjectFromName(name: string): Promise<ContextProject | undefined> {
@@ -1688,7 +1889,7 @@ async function createContextProjectFromName(name: string): Promise<ContextProjec
     if (!trimmed) {
         return undefined;
     }
-    const existingProjects = await mcpClient.listContextProjects(true).catch(() => []);
+    const existingProjects = await aggregator.listContextProjects(true).catch(() => []);
     const matching = existingProjects.find((project: ContextProject) => {
         return String(project.name || '').toLowerCase() === trimmed.toLowerCase();
     });
@@ -1696,7 +1897,13 @@ async function createContextProjectFromName(name: string): Promise<ContextProjec
         return matching;
     }
     const id = makeProjectId(trimmed, existingProjects);
-    await mcpClient.createContextProject(buildDefaultProjectEntity(id, trimmed));
+    const entity = buildDefaultProjectEntity(id, trimmed);
+    if (isContextCatalogReplicationEnabled() && contextCatalogSync) {
+        await contextCatalogSync.pushEntityToAllConnected(entity);
+        scheduleContextCatalogSyncAfterMutation();
+    } else {
+        await mcpClient.createContextProject(entity);
+    }
     return {
         id,
         name: trimmed,
@@ -1766,7 +1973,7 @@ async function pickOrCreateProject(options: { title: string; placeHolder: string
                 return;
             }
             if (selected?.action === 'existing') {
-                settle(selected.project);
+                settle(selected.project ? normalizeContextProjectForBinding(selected.project) : undefined);
                 quickPick.hide();
                 return;
             }
@@ -1786,7 +1993,7 @@ async function pickOrCreateProject(options: { title: string; placeHolder: string
     });
 
     quickPick.busy = true;
-    allProjects = await mcpClient.listContextProjects(true).catch(() => []);
+    allProjects = await aggregator.listContextProjects(true).catch(() => []);
     quickPick.busy = false;
     refreshItems('');
     quickPick.onDidChangeValue((value) => refreshItems(value));
@@ -1936,5 +2143,9 @@ function getLegacyServerUrl(): string {
 }
 
 export function deactivate() {
+    if (contextCatalogMutationDebounceTimer) {
+        clearTimeout(contextCatalogMutationDebounceTimer);
+        contextCatalogMutationDebounceTimer = undefined;
+    }
     console.log('RiotPlan extension is now deactivated');
 }

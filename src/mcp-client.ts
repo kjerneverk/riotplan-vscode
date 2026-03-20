@@ -701,6 +701,58 @@ export class HttpMcpClient {
         return null;
     }
 
+    async updateContextProject(id: string, changes: Record<string, unknown>): Promise<any> {
+        const result = await this.sendRequest('tools/call', {
+            name: 'riotplan_context',
+            arguments: {
+                action: 'update',
+                entityType: 'project',
+                id,
+                changes,
+            },
+        });
+        if (result?.content?.[0]?.type === 'text') {
+            return JSON.parse(result.content[0].text);
+        }
+        return result;
+    }
+
+    /**
+     * Create or replace a project by UUID (requires server with riotplan_context upsert).
+     * Falls back to create / update on older servers.
+     */
+    async upsertContextProject(entity: Record<string, unknown>): Promise<any> {
+        const id = typeof entity.id === 'string' ? entity.id.trim() : '';
+        try {
+            const result = await this.sendRequest('tools/call', {
+                name: 'riotplan_context',
+                arguments: {
+                    action: 'upsert',
+                    entityType: 'project',
+                    entity,
+                },
+            });
+            if (result?.content?.[0]?.type === 'text') {
+                return JSON.parse(result.content[0].text);
+            }
+            return result;
+        } catch (e) {
+            const errText = e instanceof Error ? e.message : String(e);
+            const legacy = /invalid|unknown|upsert|enum|unrecognized|parse/i.test(errText);
+            if (!legacy || !id) {
+                throw e;
+            }
+            const existing = await this.getContextProject(id).catch(() => null);
+            if (existing) {
+                const rest = { ...(entity as Record<string, unknown>) };
+                delete rest.id;
+                delete rest.type;
+                return await this.updateContextProject(id, rest);
+            }
+            return await this.createContextProject(entity);
+        }
+    }
+
     async readContext(planPath: string): Promise<any> {
         const result = await this.callToolWithArgFallback(
             'riotplan_read_context',

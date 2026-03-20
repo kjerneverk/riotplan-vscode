@@ -143,6 +143,27 @@ describe('ProjectDetailPanel class', () => {
         panel.__dispose();
     });
 
+    it('strips server scope from id when calling getContextProject', async () => {
+        const client = {
+            getContextProject: vi.fn(async () => ({
+                id: 'fae4cd7a-8510-41a9-974e-6954ccfc515b',
+                name: 'FjellGrunn',
+                active: true,
+            })),
+            listPlans: vi.fn(async () => ({
+                content: [{ type: 'text', text: JSON.stringify({ plans: [] }) }],
+            })),
+        };
+
+        ProjectDetailPanel.createOrShow(
+            'default-server::fae4cd7a-8510-41a9-974e-6954ccfc515b',
+            client as any
+        );
+        await flush();
+
+        expect(client.getContextProject).toHaveBeenCalledWith('fae4cd7a-8510-41a9-974e-6954ccfc515b');
+    });
+
     it('renders error html when project loading fails', async () => {
         const client = {
             getContextProject: vi.fn(async () => {

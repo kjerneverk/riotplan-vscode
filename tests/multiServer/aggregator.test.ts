@@ -42,6 +42,10 @@ function makeManager() {
     const manager = {
         getProfiles: vi.fn(() => profiles),
         getClient: vi.fn((serverId: string) => (serverId === 'srv-a' ? serverAClient : serverBClient)),
+        getStatuses: vi.fn(() => [
+            { serverId: 'srv-a', state: 'connected' as const, serverUrl: 'http://a' },
+            { serverId: 'srv-b', state: 'connected' as const, serverUrl: 'http://b' },
+        ]),
     };
 
     return { manager, serverAClient, serverBClient };
@@ -83,5 +87,36 @@ describe('MultiServerAggregator', () => {
 
         expect(serverAClient.listContextProjects).toHaveBeenCalledWith(true);
         expect(serverBClient.listContextProjects).toHaveBeenCalledWith(true);
+    });
+
+    it('dedupes context projects by catalog UUID when enabled', async () => {
+        const uuid = 'fae4cd7a-8510-41a9-974e-6954ccfc515b';
+        const { manager, serverAClient, serverBClient } = makeManager();
+        serverAClient.listContextProjects = vi.fn(async () => [
+            {
+                id: uuid,
+                name: 'Winner',
+                catalogRevision: 2,
+                catalogUpdatedAt: '2026-01-01T00:00:00.000Z',
+            },
+        ]);
+        serverBClient.listContextProjects = vi.fn(async () => [
+            {
+                id: uuid,
+                name: 'Other',
+                catalogRevision: 2,
+                catalogUpdatedAt: '2025-01-01T00:00:00.000Z',
+            },
+        ]);
+
+        const aggregator = new MultiServerAggregator(manager as any, {
+            dedupeContextProjectsByCatalogId: true,
+            preferredServerIdForContextUi: 'srv-a',
+        });
+        const projects = await aggregator.listContextProjects(true);
+        expect(projects).toHaveLength(1);
+        expect(projects[0].name).toBe('Winner');
+        expect(projects[0].id).toBe(`srv-a::${uuid}`);
+        expect(projects[0].serverId).toBe('srv-a');
     });
 });
