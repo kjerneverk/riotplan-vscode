@@ -15,3 +15,4 @@ input/
 *.vsix
 .kodrdriv*
 package-lock.json
+.kodrdriv*
