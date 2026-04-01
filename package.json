@@ -2,7 +2,7 @@
   "name": "riotplan-vscode",
   "displayName": "RiotPlan",
   "description": "Plan management for RiotPlan HTTP server",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "publisher": "kjerneverk",
   "engines": {
     "vscode": "^1.60.0"
@@ -439,7 +439,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/kjerneverk/riotplan-vscode"
+    "url": "https://github.com/planvokter/riotplan-vscode"
   },
   "license": "Apache-2.0",
   "author": "Tim O'Brien <tobrien@discursive.com>",
