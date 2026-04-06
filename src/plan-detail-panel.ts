@@ -524,12 +524,13 @@ export class PlanDetailPanel {
 
     private async _copyPlanIdToClipboard(): Promise<void> {
         try {
-            await vscode.env.clipboard.writeText(this.planPath);
-            vscode.window.setStatusBarMessage('Copied plan ID to clipboard', 2000);
+            const planUrl = `riotplan://plan/${this.planPath}`;
+            await vscode.env.clipboard.writeText(planUrl);
+            vscode.window.setStatusBarMessage('Copied plan URL to clipboard', 2000);
             this._panel.webview.postMessage({ command: 'copyPlanIdResult', ok: true });
         } catch (error) {
             this._panel.webview.postMessage({ command: 'copyPlanIdResult', ok: false });
-            vscode.window.showErrorMessage(`Failed to copy plan ID: ${error}`);
+            vscode.window.showErrorMessage(`Failed to copy plan URL: ${error}`);
         }
     }
 

@@ -1635,11 +1635,18 @@ function resolvePlanRef(plan: PlanItem | any): string | undefined {
         typeof plan?.name === 'string' && /^[0-9a-f]{8}-/i.test(plan.name)
             ? plan.name
             : undefined;
-    const ref = plan?.planId ?? plan?.id ?? sqliteNameRef ?? plan?.uuid ?? plan?.path;
-    if (typeof ref === 'string' && ref.trim()) {
-        return ref.trim();
+    const rawRef = plan?.planId ?? plan?.id ?? sqliteNameRef ?? plan?.uuid ?? plan?.path;
+    if (typeof rawRef !== 'string' || !rawRef.trim()) {
+        return undefined;
     }
-    return undefined;
+    const ref = rawRef.trim();
+    // If the fallback resolved to a filesystem path, extract the plan ID
+    // (e.g. "/Users/tim/.riotplan/plans/active/094f50cc-my-plan.plan" → "094f50cc-my-plan")
+    if (ref.includes('/') || ref.includes('\\')) {
+        const basename = ref.split(/[\\/]+/).pop() || ref;
+        return basename.replace(/\.plan$/, '');
+    }
+    return ref;
 }
 
 function resolvePlanClientAndRef(scopedPlanRef: string): { client: HttpMcpClient; planRef: string } {
